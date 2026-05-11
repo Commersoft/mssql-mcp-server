@@ -12,7 +12,8 @@ import sys
 from typing import Optional, Tuple, List, Dict, Any
 from pyodbc import connect, Error as PyODBCError
 from mcp.server import Server
-from mcp.types import Resource, Tool, TextContent
+from mcp.types import Resource, ResourceTemplate, Tool, TextContent
+from urllib.parse import quote
 from pydantic import AnyUrl
 
 # Configure logging
@@ -369,6 +370,12 @@ class SQLExecutor:
 app = Server("mssql_mcp_server")
 
 
+@app.list_resource_templates()
+async def list_resource_templates() -> List[ResourceTemplate]:
+    """Return empty list — no resource templates defined."""
+    return []
+
+
 @app.list_resources()
 async def list_resources() -> List[Resource]:
     """List MSSQL tables as resources."""
@@ -397,9 +404,10 @@ async def list_resources() -> List[Resource]:
                 resources = []
                 for schema, table, created, modified in tables:
                     full_table_name = f"{schema}.{table}"
+                    safe_name = quote(full_table_name, safe="")
                     resources.append(
                         Resource(
-                            uri=f"mssql://{database}/{full_table_name}/schema",
+                            uri=f"mssql:///{database}/{safe_name}/schema",
                             name=f"Schema: {full_table_name}",
                             mimeType="application/json",
                             description=f"Schema definition for table {full_table_name}"
@@ -407,7 +415,7 @@ async def list_resources() -> List[Resource]:
                     )
                     resources.append(
                         Resource(
-                            uri=f"mssql://{database}/{full_table_name}/data",
+                            uri=f"mssql:///{database}/{safe_name}/data",
                             name=f"Data: {full_table_name}",
                             mimeType="text/plain",
                             description=f"Sample data from table {full_table_name} (limited to 100 rows)"
