@@ -16,6 +16,8 @@ from mcp.types import Resource, ResourceTemplate, Tool, TextContent
 from urllib.parse import quote
 from pydantic import AnyUrl
 
+from . import rag_tools
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -582,7 +584,8 @@ async def list_tools() -> List[Tool]:
                 },
                 "required": ["query"]
             }
-        )
+        ),
+        *rag_tools.tool_descriptors(),
     ]
 
 
@@ -590,7 +593,16 @@ async def list_tools() -> List[Tool]:
 async def call_tool(name: str, arguments: dict) -> List[TextContent]:
     """Execute SQL commands."""
     logger.info(f"Calling tool: {name}")
-    
+
+    if name in rag_tools.RAG_TOOL_NAMES:
+        try:
+            _, connection_string = DatabaseConfig.get_config()
+            text = rag_tools.handle_tool(name, arguments or {}, connection_string)
+            return [TextContent(type="text", text=text)]
+        except Exception as e:
+            logger.error(f"Error in RAG tool {name}: {e}", exc_info=True)
+            return [TextContent(type="text", text=f"Error: {e}")]
+
     if name != "execute_sql":
         raise ValueError(f"Unknown tool: {name}")
     

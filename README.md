@@ -10,6 +10,58 @@ A Model Context Protocol (MCP) server implementation for Microsoft SQL Server. T
 - 🔐 **Flexible Authentication**: Supports both Windows (trusted) and SQL authentication
 - ⚙️ **Environment Configuration**: Easy setup via environment variables
 - 🛡️ **Security**: Connection string encryption, certificate trust options, and secure credential handling
+- 🔎 **RAG keyword search (Step 1)**: keyword retrieval over SQL objects, NG window metadata and workspace files — see [RAG tools](#rag-tools-step-1)
+
+## RAG tools (Step 1)
+
+The server exposes additional tools for retrieval-augmented workflows. They use
+plain `LIKE` keyword search (no embeddings) and are safe for everyday Copilot
+use:
+
+| Tool | Purpose |
+|---|---|
+| `rag_search_sql` | Search `sys.sql_modules` + `sys.objects` for procedures, functions, views, triggers, tables. Returns ranked hits with snippet. |
+| `rag_search_ng_window` | Search `csNGAppWindows` — by `appWindowIdent`, `appWindowDesc_PL/EN` and the aggregated `dataSets` JSON column (which contains all datasets, fields, actions, layouts and lookupDefs of the window). Read-only. |
+| `rag_search_components` | Grep across `.vue` / `.ts` / `.md` files under the workspace root. Default roots: `csNuxtComponents`, `app/configuration/definitions`, `.github`. |
+| `rag_get_sql_object` | Return the full text of a SQL object via `dbo.csSysScriptSqlObject` (with `sys.sql_modules` fallback). |
+| `rag_get_file` | Return file contents under the workspace root (read-only, path-traversal protected, 256 KB cap). |
+
+Configure file-based tools via two environment variables:
+
+```env
+RAG_WORKSPACE_ROOT=C:\node\csNuxt
+RAG_COMPONENT_DIRS=csNuxtComponents,app/configuration/definitions,.github
+```
+
+If `RAG_WORKSPACE_ROOT` is not set, it defaults to the parent of the
+`mssql-mcp-server` folder.
+
+### VS Code MCP setup
+
+Register the server in `.vscode/mcp.json` (workspace) — the `envFile` entry is
+**required**, the server reads credentials from environment variables and does
+not call `load_dotenv()` itself:
+
+```jsonc
+{
+  "servers": {
+    "csnuxt-rag": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["run_server.py"],
+      "cwd": "${workspaceFolder}/mssql-mcp-server",
+      "envFile": "${workspaceFolder}/mssql-mcp-server/.env",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
+```
+
+Without `envFile`, the server fails on startup with
+`MSSQL_DATABASE environment variable is required`.
 
 ## Installation
 
