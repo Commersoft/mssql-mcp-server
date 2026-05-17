@@ -2,11 +2,12 @@
 RAG (Retrieval-Augmented Generation) tools for the MSSQL MCP Server.
 
 Step 1 (keyword-based, no embeddings):
-- rag_search_sql        : search across sys.sql_modules + sys.objects
-- rag_search_ng_window  : search across csNGAppWindow* metadata
-- rag_search_components : grep across .vue / .md files under WORKSPACE_ROOT
-- rag_get_sql_object    : full text of a SQL object via dbo.csSysScriptSqlObject
-- rag_get_file          : read a file under WORKSPACE_ROOT
+- rag_search_sql                : search across sys.sql_modules + sys.objects
+- rag_search_ng_window          : search across csNGAppWindow* metadata
+- rag_search_components         : grep across .vue / .md files under WORKSPACE_ROOT
+- rag_get_sql_object            : full text of a SQL object via dbo.csSysScriptSqlObject
+- rag_get_dict_action_view_html : Dict action layout HTML (csAppWindowDataSetSQLTypesActions.ActionViewHtml)
+- rag_get_file                  : read a file under WORKSPACE_ROOT
 
 Environment:
 - RAG_WORKSPACE_ROOT : absolute path to the workspace root used by file-based tools.
@@ -387,6 +388,84 @@ def get_sql_object(connection_string: str, object_name: str) -> str:
             return row[0] if row and row[0] else ""
 
 
+_IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def get_dict_action_view_html(
+    connection_string: str,
+    app_window: str,
+    dataset_ident: Optional[str] = None,
+    action_ident: Optional[str] = None,
+) -> str:
+    """Return Dict action form layout HTML from csAppWindowDataSetSQLTypesActions.
+
+    Joins csAppWindows → csAppWindowDataSetSQLTypes → csAppWindowDataSetSQLTypesActions.
+    - app_window     : csAppWindows.AppWindow (required).
+    - dataset_ident  : csAppWindowDataSetSQLTypes.DataSetSQLIdent (default = app_window).
+    - action_ident   : csAppWindowDataSetSQLTypesActions.ActionIdent. If omitted,
+                       returns a list of available actions with kind + HTML length.
+    """
+    if not app_window or not _IDENT_RE.match(app_window):
+        raise ValueError("Invalid app_window")
+    ds_ident = dataset_ident or app_window
+    if not _IDENT_RE.match(ds_ident):
+        raise ValueError("Invalid dataset_ident")
+    if action_ident is not None and action_ident != "" and not _IDENT_RE.match(action_ident):
+        raise ValueError("Invalid action_ident")
+
+    with connect(connection_string) as conn:
+        with conn.cursor() as cur:
+            if action_ident:
+                cur.execute(
+                    """
+                    select cast(a.ActionViewHtml as nvarchar(max))
+                    from dbo.csAppWindowDataSetSQLTypesActions a with(nolock)
+                    inner join dbo.csAppWindowDataSetSQLTypes d with(nolock)
+                      on d.csAppWindowDataSetSQLTypesG = a.csAppWindowDataSetSQLTypesG
+                    inner join dbo.csAppWindows aw with(nolock)
+                      on aw.csAppWindowsG = d.csAppWindowsG
+                    where aw.AppWindow = ?
+                      and d.DataSetSQLIdent = ?
+                      and a.ActionIdent = ?
+                    """,
+                    app_window,
+                    ds_ident,
+                    action_ident,
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise FileNotFoundError(
+                        f"No action '{action_ident}' on {app_window}/{ds_ident}"
+                    )
+                return row[0] or ""
+
+            # List actions for the dataset (no specific action requested).
+            cur.execute(
+                """
+                select a.ActionIdent,
+                       isnull(a.Kind, N''),
+                       len(cast(a.ActionViewHtml as nvarchar(max)))
+                from dbo.csAppWindowDataSetSQLTypesActions a with(nolock)
+                inner join dbo.csAppWindowDataSetSQLTypes d with(nolock)
+                  on d.csAppWindowDataSetSQLTypesG = a.csAppWindowDataSetSQLTypesG
+                inner join dbo.csAppWindows aw with(nolock)
+                  on aw.csAppWindowsG = d.csAppWindowsG
+                where aw.AppWindow = ?
+                  and d.DataSetSQLIdent = ?
+                order by a.ActionIdent
+                """,
+                app_window,
+                ds_ident,
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return f"(no actions on {app_window}/{ds_ident})"
+            lines = [f"# Actions on {app_window}/{ds_ident}"]
+            for ident, kind, html_len in rows:
+                lines.append(f"- {ident}  kind={kind or '-'}  htmlLen={html_len or 0}")
+            return "\n".join(lines)
+
+
 def get_file(relpath: str) -> str:
     if not relpath:
         raise ValueError("relpath is required")
@@ -495,6 +574,33 @@ def tool_descriptors():
             },
         ),
         Tool(
+            name="rag_get_dict_action_view_html",
+            description=(
+                "Return the Dict form layout HTML (csAppWindowDataSetSQLTypesActions.ActionViewHtml) "
+                "used as the source of truth when migrating Dict ins/upd/custom action forms to NG "
+                "(main_ins.vue / main_upd.vue / <actionIdent>.vue). "
+                "Without action_ident: lists available actions for the app_window/dataset_ident."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window": {
+                        "type": "string",
+                        "description": "csAppWindows.AppWindow, e.g. 'csTaxationForms'.",
+                    },
+                    "dataset_ident": {
+                        "type": "string",
+                        "description": "csAppWindowDataSetSQLTypes.DataSetSQLIdent. Default = app_window.",
+                    },
+                    "action_ident": {
+                        "type": "string",
+                        "description": "csAppWindowDataSetSQLTypesActions.ActionIdent, e.g. 'csTaxationFormsInsert'. Omit to list actions.",
+                    },
+                },
+                "required": ["app_window"],
+            },
+        ),
+        Tool(
             name="rag_get_file",
             description="Return the content of a file under the workspace root (read-only).",
             inputSchema={
@@ -517,6 +623,7 @@ RAG_TOOL_NAMES = {
     "rag_search_ng_window",
     "rag_search_components",
     "rag_get_sql_object",
+    "rag_get_dict_action_view_html",
     "rag_get_file",
 }
 
@@ -559,6 +666,15 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
 
     if name == "rag_get_sql_object":
         text = get_sql_object(connection_string, arguments.get("object_name", ""))
+        return text or "(empty)"
+
+    if name == "rag_get_dict_action_view_html":
+        text = get_dict_action_view_html(
+            connection_string,
+            app_window=arguments.get("app_window", ""),
+            dataset_ident=arguments.get("dataset_ident") or None,
+            action_ident=arguments.get("action_ident") or None,
+        )
         return text or "(empty)"
 
     if name == "rag_get_file":
