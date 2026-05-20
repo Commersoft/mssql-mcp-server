@@ -263,36 +263,58 @@ class SQLExecutor:
             Tuple of (success, results, error_message)
         """
         try:
-            # Preprocess the query
-            original_query = query
-            processed_query = self.preprocessor.preprocess_query(query)
-            
-            if original_query != processed_query:
-                logger.debug(f"Query preprocessed. Original length: {len(original_query)}, "
-                           f"Processed length: {len(processed_query)}")
-            
+            # Preprocessing wyłączone — pyodbc/SQL Server obsługuje newline, taby,
+            # GO-batche (rozbijamy sami poniżej) i komentarze natywnie.
+            # Stary QueryPreprocessor gubił newline'y, zwijał spacje i obcinał wszystko po pierwszym GO.
+            processed_query = query
+
+            # Rozbij na batche po linii zawierającej tylko `GO` (konwencja sqlcmd).
+            # Opcjonalna liczba powtórzeń `GO N` jest honorowana.
+            batches: List[Tuple[str, int]] = []
+            current: List[str] = []
+            go_re = re.compile(r'^\s*GO\s*(\d+)?\s*(?:--.*)?$', re.IGNORECASE)
+            for line in processed_query.splitlines():
+                m = go_re.match(line)
+                if m:
+                    text = "\n".join(current).strip()
+                    if text:
+                        batches.append((text, int(m.group(1)) if m.group(1) else 1))
+                    current = []
+                else:
+                    current.append(line)
+            tail = "\n".join(current).strip()
+            if tail:
+                batches.append((tail, 1))
+            if not batches:
+                return True, ["(empty query)"], None
+
+            aggregated: List[str] = []
             with connect(self.connection_string) as conn:
                 with conn.cursor() as cursor:
-                    # Execute the query
-                    cursor.execute(processed_query)
-                    
-                    # Handle different query types
-                    query_upper = processed_query.strip().upper()
-                    
-                    # SELECT queries
-                    if query_upper.startswith("SELECT") or query_upper.startswith("WITH"):
-                        return self._handle_select_query(cursor)
-                    
-                    # SHOW TABLES (non-standard SQL Server)
-                    elif query_upper == "SHOW TABLES":
-                        return self._handle_show_tables(cursor, conn)
-                    
-                    # INSERT, UPDATE, DELETE, etc.
-                    else:
-                        conn.commit()
-                        rows_affected = cursor.rowcount if cursor.rowcount >= 0 else 0
-                        return True, [f"Query executed successfully. Rows affected: {rows_affected}"], None
-                    
+                    for idx, (batch_sql, repeat) in enumerate(batches, start=1):
+                        for _ in range(repeat):
+                            cursor.execute(batch_sql)
+                            batch_upper = batch_sql.lstrip().upper()
+                            if batch_upper.startswith("SELECT") or batch_upper.startswith("WITH"):
+                                ok, rows, err = self._handle_select_query(cursor)
+                                if not ok:
+                                    return False, aggregated, err
+                                if len(batches) > 1:
+                                    aggregated.append(f"-- batch {idx} --")
+                                aggregated.extend(rows)
+                            elif batch_upper == "SHOW TABLES":
+                                ok, rows, err = self._handle_show_tables(cursor, conn)
+                                if not ok:
+                                    return False, aggregated, err
+                                aggregated.extend(rows)
+                            else:
+                                conn.commit()
+                                rows_affected = cursor.rowcount if cursor.rowcount >= 0 else 0
+                                if len(batches) > 1:
+                                    aggregated.append(f"-- batch {idx} --")
+                                aggregated.append(f"Query executed successfully. Rows affected: {rows_affected}")
+                    return True, aggregated, None
+
         except PyODBCError as e:
             error_msg = str(e)
             logger.error(f"Database error executing query: {error_msg}")
