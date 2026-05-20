@@ -293,26 +293,53 @@ class SQLExecutor:
                 with conn.cursor() as cursor:
                     for idx, (batch_sql, repeat) in enumerate(batches, start=1):
                         for _ in range(repeat):
-                            cursor.execute(batch_sql)
                             batch_upper = batch_sql.lstrip().upper()
-                            if batch_upper.startswith("SELECT") or batch_upper.startswith("WITH"):
-                                ok, rows, err = self._handle_select_query(cursor)
-                                if not ok:
-                                    return False, aggregated, err
-                                if len(batches) > 1:
-                                    aggregated.append(f"-- batch {idx} --")
-                                aggregated.extend(rows)
-                            elif batch_upper == "SHOW TABLES":
+                            # Backward-compatible alias used by some clients.
+                            if batch_upper == "SHOW TABLES":
+                                cursor.execute(batch_sql)
                                 ok, rows, err = self._handle_show_tables(cursor, conn)
                                 if not ok:
                                     return False, aggregated, err
                                 aggregated.extend(rows)
-                            else:
-                                conn.commit()
-                                rows_affected = cursor.rowcount if cursor.rowcount >= 0 else 0
-                                if len(batches) > 1:
-                                    aggregated.append(f"-- batch {idx} --")
-                                aggregated.append(f"Query executed successfully. Rows affected: {rows_affected}")
+                                continue
+
+                            cursor.execute(batch_sql)
+                            if len(batches) > 1:
+                                aggregated.append(f"-- batch {idx} --")
+
+                            # Iterate every result set produced by the batch. A single
+                            # batch may emit multiple rowsets (multiple SELECTs, procs
+                            # returning intermediate result sets, etc.). The previous
+                            # implementation only looked at cursor.description when the
+                            # batch text started with SELECT/WITH, so DECLARE/EXEC/SET
+                            # batches silently dropped every SELECT in the script and
+                            # only reported "Rows affected: 0".
+                            result_set_idx = 0
+                            had_any_rowset = False
+                            total_rows_affected = 0
+                            while True:
+                                if cursor.description:
+                                    had_any_rowset = True
+                                    result_set_idx += 1
+                                    if result_set_idx > 1:
+                                        aggregated.append(f"-- result set {result_set_idx} --")
+                                    ok, rows, err = self._handle_select_query(cursor)
+                                    if not ok:
+                                        return False, aggregated, err
+                                    aggregated.extend(rows)
+                                else:
+                                    rc = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else 0
+                                    total_rows_affected += rc
+                                try:
+                                    if not cursor.nextset():
+                                        break
+                                except PyODBCError:
+                                    # Some drivers raise after the last result set has
+                                    # been consumed — treat as end of batch.
+                                    break
+                            if not had_any_rowset:
+                                aggregated.append(f"Query executed successfully. Rows affected: {total_rows_affected}")
+                            conn.commit()
                     return True, aggregated, None
 
         except PyODBCError as e:
