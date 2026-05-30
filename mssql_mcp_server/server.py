@@ -303,6 +303,9 @@ class SQLExecutor:
                                 aggregated.extend(rows)
                                 continue
 
+                            # Wyczyść ewentualne otwarte transakcje pozostawione
+                            # przez poprzedni batch/zapytanie zanim wykonamy bieżący.
+                            cursor.execute("while @@trancount > 0 rollback tran")
                             cursor.execute(batch_sql)
                             if len(batches) > 1:
                                 aggregated.append(f"-- batch {idx} --")

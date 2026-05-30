@@ -33,6 +33,8 @@ def execute_sql(query: str) -> str:
     try:
         with pyodbc.connect(_connection_string()) as conn:
             with conn.cursor() as cursor:
+                # Wyczyść ewentualne otwarte transakcje przed wykonaniem batcha.
+                cursor.execute("while @@trancount > 0 rollback tran")
                 cursor.execute(query)
                 if cursor.description:
                     cols = [d[0] for d in cursor.description]
