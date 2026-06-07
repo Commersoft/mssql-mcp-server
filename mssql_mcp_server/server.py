@@ -290,6 +290,7 @@ class SQLExecutor:
 
             aggregated: List[str] = []
             with connect(self.connection_string) as conn:
+                conn.autocommit = True  # nie otwieraj niejawnej transakcji
                 with conn.cursor() as cursor:
                     for idx, (batch_sql, repeat) in enumerate(batches, start=1):
                         for _ in range(repeat):
