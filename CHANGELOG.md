@@ -5,6 +5,19 @@ All notable changes to the MSSQL MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — cs* write/automation tools (`cs_tools.py`)
+Narzędzia kapsułkujące niejawne reguły frameworku cs* (egzekwowane programowo zamiast „z pamięci agenta"):
+
+- **`deploy_sql_object`** — deploy procedury/funkcji/widoku/triggera przez `csAddObjVer`. Automatycznie: `objectName` bez prefiksu `dbo.`, `@pv` = najnowsza wersja, świeży unikalny `@v` (sprawdzany pod kątem kolizji), podział na 3 batche (omija problem `GO`), sprzątanie osieroconego `inProgress=1`.
+- **`cs_jsonsave`** — generyczny wrapper na `<T>JSONSave` z **parametryzowanym** `@data` (koniec z błędami escapowania multiline/diakrytyków). Parsuje `@response xml` → czytelny wynik.
+- **`add_cs_column`** — kolumna do tabeli cs* przez `csSysColumnsJSONSave` + `csSysTablesRebuild`. Auto `ColumnOrder`, wymóg kompletu 12× `ColumnDesc_XX`, oba parametry rebuild. Idempotentne.
+- **`add_ng_field`** — pole okna NG: Fields + LayoutsCols (+ opcjonalne wstrzyknięcie `<c-edit>` do `viewHTML` akcji ins/upd). Idempotentny UPSERT; ustawia `labelDataFieldIdent` i niezerowy `width`.
+- **`get_cs_object_versions`** — historia `csSysObjVer` + stan `inProgress` obiektu (diagnostyka deployu).
+
+Wszystkie podłączone w `server.py` (`CS_TOOL_NAMES`, `tool_descriptors`, dispatch w `call_tool`).
+
 ## [1.0.0] - 2025-07-02
 
 ### Added

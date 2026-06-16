@@ -17,6 +17,7 @@ from urllib.parse import quote
 from pydantic import AnyUrl
 
 from . import rag_tools
+from . import cs_tools
 
 # Configure logging
 logging.basicConfig(
@@ -639,6 +640,7 @@ async def list_tools() -> List[Tool]:
             }
         ),
         *rag_tools.tool_descriptors(),
+        *cs_tools.tool_descriptors(),
     ]
 
 
@@ -654,6 +656,15 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
             return [TextContent(type="text", text=text)]
         except Exception as e:
             logger.error(f"Error in RAG tool {name}: {e}", exc_info=True)
+            return [TextContent(type="text", text=f"Error: {e}")]
+
+    if name in cs_tools.CS_TOOL_NAMES:
+        try:
+            _, connection_string = DatabaseConfig.get_config()
+            text = cs_tools.handle_tool(name, arguments or {}, connection_string)
+            return [TextContent(type="text", text=text)]
+        except Exception as e:
+            logger.error(f"Error in cs tool {name}: {e}", exc_info=True)
             return [TextContent(type="text", text=f"Error: {e}")]
 
     if name != "execute_sql":
