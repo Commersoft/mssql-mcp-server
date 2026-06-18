@@ -560,6 +560,132 @@ def get_cs_object_versions(
 
 
 # ---------------------------------------------------------------------------
+# 6. update_view_html  (sync .vue <template> -> DB viewHTML, like husky)
+# ---------------------------------------------------------------------------
+
+def _extract_template(vue_source: str) -> Optional[str]:
+    """
+    Extract the inner content of the ROOT <template>...</template> block, replicating
+    the husky/csRestAPIcsNGAppWindowsViewHTMLSave logic: take the lines strictly
+    between a line that is exactly '<template>' and the LAST line that is exactly
+    '</template>', trim each line, drop blanks, join with CRLF, then ##asterix## -> *.
+    Nested slot templates (<template #slot>) are preserved (they are not exact
+    '<template>' so they don't move the boundaries).
+    """
+    lines = vue_source.splitlines()
+    start = None
+    end = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s == "<template>" and start is None:
+            start = i
+        if s == "</template>":
+            end = i
+    if start is None or end is None or end <= start:
+        return None
+    inner = [line.strip() for line in lines[start + 1:end]]
+    inner = [line for line in inner if line != ""]
+    template = "\r\n".join(inner).replace("##asterix##", "*")
+    return template or None
+
+
+def update_view_html(
+    connection_string: str,
+    app_window_ident: str,
+    file_path: Optional[str] = None,
+    content: Optional[str] = None,
+    component: Optional[str] = None,
+    namespace_g: str = DEFAULT_NAMESPACE_G,
+) -> str:
+    """
+    Sync a window/action .vue <template> into the DB viewHTML on demand — same effect
+    as the husky pre-commit hook, but without commit+push. Saves through the proper
+    JSONSave (so csNGAppWindows.dataSets cache rebuilds itself):
+      - window/grid file (component == app_window_ident, e.g. csMicroOrders.vue)
+        -> csNGAppWindows.viewHTML via csNGAppWindowsJSONSave.
+      - action form file (component == '<dataSet>_<action>', e.g. main_ins.vue)
+        -> csNGAppWindowDataSetsActions.viewHTML via csNGAppWindowDataSetsActionsJSONSave.
+
+    Provide `file_path` (preferred) or raw `content`. `component` defaults to the file
+    base name without '.vue'.
+    """
+    aw = (app_window_ident or "").strip()
+    if not aw:
+        return "Error: app_window_ident is required."
+
+    if content is None:
+        if not file_path:
+            return "Error: provide file_path or content."
+        try:
+            with open(file_path, "r", encoding="utf-8") as fh:
+                content = fh.read()
+        except OSError as exc:
+            return f"Error: cannot read file_path: {exc}"
+
+    if component is None:
+        import os
+        base = os.path.basename(file_path) if file_path else aw
+        component = re.sub(r"\.vue$", "", base, flags=re.IGNORECASE)
+    component = component.strip()
+
+    template = _extract_template(content)
+    if not template:
+        return ("Error: no <template>...</template> found "
+                "(need a line that is exactly '<template>' and one that is exactly '</template>').")
+
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            if component == aw:
+                target = f"csNGAppWindows.viewHTML [{aw}]"
+                sql = (
+                    "set nocount on;\n"
+                    "declare @vh nvarchar(max)=?, @ns uniqueidentifier=?, @aw nvarchar(200)=?;\n"
+                    "declare @data nvarchar(max), @response xml, @cnt int;\n"
+                    "select @cnt = count(*) from dbo.csNGAppWindows where csAppNameSpacesG=@ns and appWindowIdent=@aw;\n"
+                    "set @data = (select N'U' [_opr], w.csNGAppWindowsId, w.csNGAppWindowsG, w.csAppNameSpacesG, "
+                    "w.appWindowIdent, @vh viewHTML from dbo.csNGAppWindows w "
+                    "where w.csAppNameSpacesG=@ns and w.appWindowIdent=@aw for json path, include_null_values);\n"
+                    "if @data is not null exec dbo.csNGAppWindowsJSONSave @data=@data, @response=@response out;\n"
+                    "select @cnt [matched], convert(nvarchar(max), @response) [response];"
+                )
+                cur.execute(sql, (template, namespace_g, aw))
+            else:
+                parts = component.split("_")
+                if len(parts) < 2:
+                    return (f"Error: action file '{component}' must be '<dataSet>_<action>' "
+                            f"(e.g. main_ins). A window file name must equal app_window_ident.")
+                data_set_ident, action_ident = parts[0], parts[1]
+                target = f"csNGAppWindowDataSetsActions.viewHTML [{aw}/{data_set_ident}/{action_ident}]"
+                sql = (
+                    "set nocount on;\n"
+                    "declare @vh nvarchar(max)=?, @ns uniqueidentifier=?, @aw nvarchar(200)=?, "
+                    "@ds nvarchar(200)=?, @act nvarchar(200)=?;\n"
+                    "declare @data nvarchar(max), @response xml, @cnt int;\n"
+                    "select @cnt = count(*) from dbo.csNGAppWindowDataSetsActions "
+                    "where csAppNameSpacesG=@ns and appWindowIdent=@aw and dataSetIdent=@ds and actionIdent=@act;\n"
+                    "set @data = (select N'U' [_opr], a.csNGAppWindowDataSetsActionsId, a.csNGAppWindowDataSetsActionsG, "
+                    "a.csAppNameSpacesG, a.appWindowIdent, a.dataSetIdent, a.actionIdent, @vh viewHTML "
+                    "from dbo.csNGAppWindowDataSetsActions a "
+                    "where a.csAppNameSpacesG=@ns and a.appWindowIdent=@aw and a.dataSetIdent=@ds and a.actionIdent=@act "
+                    "for json path, include_null_values);\n"
+                    "if @data is not null exec dbo.csNGAppWindowDataSetsActionsJSONSave @data=@data, @response=@response out;\n"
+                    "select @cnt [matched], convert(nvarchar(max), @response) [response];"
+                )
+                cur.execute(sql, (template, namespace_g, aw, data_set_ident, action_ident))
+
+            row = cur.fetchone()
+            matched = (row[0] if row else 0) or 0
+            resp = _xml_response_to_text(row[1] if row else None)
+
+    if not matched:
+        return (f"Error: target not found in DB ({target}). "
+                f"Check app_window_ident / component / namespace_g.")
+    if resp is None:
+        return f"OK: {target} updated ({len(template)} chars; response NULL = success)."
+    return f"WARNING updating {target} (response):\n{resp}"
+
+
+# ---------------------------------------------------------------------------
 # MCP tool descriptors + dispatcher
 # ---------------------------------------------------------------------------
 
@@ -569,6 +695,7 @@ CS_TOOL_NAMES = {
     "add_cs_column",
     "add_ng_field",
     "get_cs_object_versions",
+    "update_view_html",
 }
 
 
@@ -679,6 +806,27 @@ def tool_descriptors():
                 "required": ["object_name"],
             },
         ),
+        Tool(
+            name="update_view_html",
+            description=(
+                "Sync a window/action .vue <template> into the DB viewHTML on demand "
+                "(same effect as the husky pre-commit, without commit+push). "
+                "component == app_window_ident -> csNGAppWindows.viewHTML; "
+                "component '<dataSet>_<action>' (e.g. main_ins) -> csNGAppWindowDataSetsActions.viewHTML. "
+                "Saves via the proper JSONSave so dataSets cache rebuilds. Provide file_path (preferred) or content."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string", "description": "Window ident (= folder name), e.g. 'csMicroOrders'."},
+                    "file_path": {"type": "string", "description": "Path to the .vue file (preferred)."},
+                    "content": {"type": "string", "description": "Raw .vue source (alternative to file_path)."},
+                    "component": {"type": "string", "description": "File base name w/o .vue. Default = file_path basename. == app_window_ident -> window; '<dataSet>_<action>' -> action."},
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard E4B58826-...)."},
+                },
+                "required": ["app_window_ident"],
+            },
+        ),
     ]
 
 
@@ -734,6 +882,16 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             connection_string,
             object_name=arguments.get("object_name", ""),
             top=int(arguments.get("top") or 10),
+        )
+
+    if name == "update_view_html":
+        return update_view_html(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            file_path=arguments.get("file_path"),
+            content=arguments.get("content"),
+            component=arguments.get("component"),
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
         )
 
     raise ValueError(f"Unknown cs tool: {name}")
