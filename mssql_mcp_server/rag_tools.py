@@ -7,6 +7,7 @@ Step 1 (keyword-based, no embeddings):
 - rag_search_components         : grep across .vue / .md files under WORKSPACE_ROOT
 - rag_get_sql_object            : full text of a SQL object via dbo.csSysScriptSqlObject
 - rag_get_dict_action_view_html : Dict action layout HTML (csAppWindowDataSetSQLTypesActions.ActionViewHtml)
+- rag_get_dict_window_html      : full Dict window anatomy (AppWindowViewHTML/XML, parsed outline)
 - rag_get_file                  : read a file under WORKSPACE_ROOT
 
 Environment:
@@ -466,6 +467,261 @@ def get_dict_action_view_html(
             return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Dict window anatomy (full window: layout + datasets)
+# ---------------------------------------------------------------------------
+
+_TAG_RE = re.compile(r"<(/?)(?:div|li|ul)\b([^>]*?)(/?)>", re.IGNORECASE)
+_ATTR_RE = re.compile(r"""([A-Za-z-]+)=(?:"([^"]*)"|(\{[^}]*\}))""")
+_GUID_ATTRS = ("LabelGuid", "CaptionGuid", "HeaderGuid", "WatermarkGuid", "TextGuid", "ToolTipGuid")
+_CONTROL_CLASSES = (
+    "csDBEditEx", "csDBEdit", "csDBCheckBox", "csDBDateTimePicker", "csDBComboBox",
+    "csDBRadioGroup", "csDBTextBlock", "csButtonAction", "csDictPanel", "csPdfViewer",
+    "csDBEditSearch",
+)
+
+
+def _parse_attrs(attr_text: str) -> dict:
+    attrs = {}
+    for m in _ATTR_RE.finditer(attr_text):
+        key = m.group(1)
+        attrs[key] = m.group(2) if m.group(2) is not None else m.group(3)
+    return attrs
+
+
+def _resolve_guids(cur, guids: set) -> dict:
+    """csTranslateG -> Content_PL for label/caption guids (chunked IN query)."""
+    result = {}
+    guid_list = [g for g in guids if g]
+    for i in range(0, len(guid_list), 200):
+        chunk = guid_list[i:i + 200]
+        placeholders = ",".join("?" for _ in chunk)
+        cur.execute(
+            f"select lower(convert(nvarchar(36), csTranslateG)), Content_PL "
+            f"from dbo.csTranslate with(nolock) "
+            f"where csTranslateG in ({placeholders})",
+            *chunk,
+        )
+        for g, pl in cur.fetchall():
+            result[g] = pl or ""
+    return result
+
+
+def _summarize_view_html(html: str, cur) -> str:
+    """Walk the Dict window HTML and emit an ordered outline of controls.
+
+    Tracks containers: dataset (data-DataSetSQLIdent), tab item (data-HeaderGuid),
+    group box (data-CaptionGuid), expander, horizontal-flow rows.
+    """
+    lines: List[str] = []
+    guids: set = set()
+    # Pass 1: collect events + guids.
+    events: List[Tuple[str, dict, int]] = []  # (kind, attrs/info, depth)
+    stack: List[dict] = []  # {closes: bool-counted, kind, row_counter}
+    row_counters: List[int] = [0]
+
+    for m in _TAG_RE.finditer(html):
+        closing, attr_text, self_closed = m.group(1), m.group(2), m.group(3)
+        if closing:
+            if stack:
+                node = stack.pop()
+                if node.get("kind") in ("tab", "groupbox", "expander", "dataset"):
+                    row_counters.pop()
+            continue
+        attrs = _parse_attrs(attr_text)
+        cls = attrs.get("class", "")
+        control = next((c for c in _CONTROL_CLASSES if c in cls), None)
+        vis = None
+        vis_raw = attrs.get("data-csVisibility")
+        if vis_raw:
+            vm = re.search(r'"DataField"\s*:\s*"([^"]+)"', vis_raw)
+            vis = vm.group(1) if vm else vis_raw
+        for ga in _GUID_ATTRS:
+            g = attrs.get(f"data-{ga}")
+            if g:
+                guids.add(g.lower())
+
+        depth = len(row_counters) - 1
+        if control:
+            info = {
+                "control": control,
+                "field": attrs.get("data-DataField") or attrs.get("data-ActionIdent")
+                or attrs.get("data-Ident") or "",
+                "label_guid": (attrs.get("data-LabelGuid") or attrs.get("data-CaptionGuid") or "").lower(),
+                "width": (re.search(r"width\s*:\s*([^;\"']+)", attrs.get("style", "")) or [None]) and
+                         (re.search(r"width\s*:\s*([^;\"']+)", attrs.get("style", "")).group(1).strip()
+                          if re.search(r"width\s*:\s*([^;\"']+)", attrs.get("style", "")) else ""),
+                "readonly": attrs.get("data-DataFieldForcsIsReadOnly", ""),
+                "lookup": attrs.get("data-LookupItemTemplateSelector", ""),
+                "format": attrs.get("data-FormatType", ""),
+                "visible_if": vis or "",
+                "flex": "cs-flex-1" in cls,
+            }
+            events.append(("control", info, depth))
+            if not self_closed:
+                stack.append({"kind": "control"})
+                row_counters.append(row_counters[-1])
+                row_counters.pop()  # controls don't add row scope
+                stack.pop()
+            continue
+
+        kind = None
+        label_guid = ""
+        name = ""
+        if "data-DataSetSQLIdent" in attrs:
+            kind, name = "dataset", attrs.get("data-DataSetSQLIdent", "")
+        elif "data-HeaderGuid" in attrs:
+            kind, label_guid = "tab", attrs.get("data-HeaderGuid", "").lower()
+        elif "csGroupBox" in cls:
+            kind, label_guid = "groupbox", (attrs.get("data-CaptionGuid") or "").lower()
+        elif "csExpander" in cls and "csExpanderHeader" not in cls and "csExpanderContent" not in cls:
+            kind = "expander"
+        elif "cs-layout-horizontal-flow" in cls:
+            row_counters[-1] += 1
+            events.append(("row", {"n": row_counters[-1]}, depth))
+            if not self_closed:
+                stack.append({"kind": "row"})
+                row_counters.append(row_counters[-1] * 0)  # rows don't nest counters
+                row_counters.pop()
+            continue
+
+        if kind:
+            events.append((kind, {"name": name, "label_guid": label_guid}, depth))
+            if label_guid:
+                guids.add(label_guid)
+            if not self_closed:
+                stack.append({"kind": kind})
+                row_counters.append(0)
+            continue
+
+        if not self_closed:
+            stack.append({"kind": "div"})
+
+    labels = _resolve_guids(cur, guids)
+
+    for kind, info, depth in events:
+        pad = "  " * depth
+        if kind == "row":
+            lines.append(f"{pad}--- row {info['n']} ---")
+        elif kind == "dataset":
+            lines.append(f"{pad}## DataSet {info['name']}")
+        elif kind == "tab":
+            lab = labels.get(info["label_guid"], "")
+            lines.append(f"{pad}## Tab \"{lab}\" ({info['label_guid'][:8]})")
+        elif kind == "groupbox":
+            lab = labels.get(info["label_guid"], "")
+            lines.append(f"{pad}[GroupBox \"{lab}\"]")
+        elif kind == "expander":
+            lines.append(f"{pad}[Expander]")
+        elif kind == "control":
+            parts = [info["control"], info["field"]]
+            lab = labels.get(info["label_guid"], "")
+            if lab:
+                parts.append(f'label="{lab}"')
+            if info["width"]:
+                parts.append(f"w={info['width']}")
+            elif info["flex"]:
+                parts.append("w=flex-1")
+            if info["readonly"]:
+                parts.append(f"readonly={info['readonly']}")
+            if info["lookup"]:
+                parts.append(f"lookup={info['lookup']}")
+            if info["format"]:
+                parts.append(f"format={info['format']}")
+            if info["visible_if"]:
+                parts.append(f"visible-if={info['visible_if']}")
+            lines.append(f"{pad}- " + "  ".join(p for p in parts if p))
+    return "\n".join(lines)
+
+
+def _summarize_xml_datasets(xml: str) -> str:
+    """List datasets from AppWindowXML: ident + SQLObject + translate fields."""
+    lines = ["## Datasets (AppWindowXML)"]
+    for chunk in xml.split("<DataSetSQLType>")[1:]:
+        ident_m = re.search(r"<DataSetSQLIdent>([^<]+)</DataSetSQLIdent>", chunk)
+        obj_m = re.search(r"<SQLObject>([^<]+)</SQLObject>", chunk)
+        if not ident_m:
+            continue
+        line = f"- {ident_m.group(1)}"
+        if obj_m:
+            line += f"  SQLObject={obj_m.group(1)}"
+        translates = re.findall(
+            r"<SourceFieldName>([^<]+)</SourceFieldName>\s*"
+            r"<TargetFieldName>([^<]+)</TargetFieldName>",
+            chunk,
+        )
+        if translates:
+            line += "  translate: " + ", ".join(f"{s}→{t}" for s, t in translates)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def get_dict_window_html(
+    connection_string: str,
+    app_window: str,
+    part: str = "summary",
+    app_windows_id: Optional[int] = None,
+) -> str:
+    """Full Dict window anatomy (csAppWindows.AppWindowViewHTML / AppWindowXML).
+
+    part='summary' (default): parsed outline — datasets (with source SQLObject and
+    translate fields) + ordered control list per tab/row with labels resolved from
+    csTranslate, widths, readonly/visibility bindings and lookup templates.
+    part='html' : raw AppWindowViewHTML. part='xml' : raw AppWindowXML.
+    """
+    if not app_window or not _IDENT_RE.match(app_window):
+        raise ValueError("Invalid app_window")
+    if part not in ("summary", "html", "xml"):
+        raise ValueError("part must be one of: summary, html, xml")
+
+    with connect(connection_string) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select csAppWindowsId,
+                       cast(AppWindowViewHTML as nvarchar(max)),
+                       cast(AppWindowXML as nvarchar(max))
+                from dbo.csAppWindows with(nolock)
+                where AppWindow = ?
+                order by len(cast(AppWindowViewHTML as nvarchar(max))) desc
+                """,
+                app_window,
+            )
+            rows = cur.fetchall()
+            if not rows:
+                raise FileNotFoundError(f"No csAppWindows row for '{app_window}'")
+            chosen = None
+            if app_windows_id is not None:
+                chosen = next((r for r in rows if r[0] == app_windows_id), None)
+                if chosen is None:
+                    raise FileNotFoundError(
+                        f"csAppWindowsId={app_windows_id} not found for '{app_window}'"
+                    )
+            else:
+                chosen = rows[0]
+            win_id, view_html, xml = chosen[0], chosen[1] or "", chosen[2] or ""
+
+            header = f"# {app_window} (csAppWindowsId={win_id})"
+            if len(rows) > 1:
+                others = ", ".join(str(r[0]) for r in rows if r[0] != win_id)
+                header += f"\n(uwaga: {len(rows)} wierszy o tej nazwie; inne csAppWindowsId: {others} — wskaż app_windows_id by wybrać)"
+
+            if part == "html":
+                return view_html or "(empty AppWindowViewHTML)"
+            if part == "xml":
+                return xml or "(empty AppWindowXML)"
+
+            sections = [header]
+            if xml:
+                sections.append(_summarize_xml_datasets(xml))
+            if view_html:
+                sections.append("## Layout (AppWindowViewHTML)")
+                sections.append(_summarize_view_html(view_html, cur))
+            else:
+                sections.append("(empty AppWindowViewHTML)")
+            return "\n\n".join(sections)
+
+
 def get_file(relpath: str) -> str:
     if not relpath:
         raise ValueError("relpath is required")
@@ -601,6 +857,38 @@ def tool_descriptors():
             },
         ),
         Tool(
+            name="rag_get_dict_window_html",
+            description=(
+                "Full Dict window anatomy (csAppWindows). part='summary' (default): "
+                "parsed outline — datasets with source SQLObject (the function holding "
+                "field expressions!) and translate fields, plus ordered control list per "
+                "tab/row with labels (resolved from csTranslate), widths, readonly/visibility "
+                "bindings and lookup templates. part='html'/'xml': raw AppWindowViewHTML/AppWindowXML. "
+                "Use when matching an NG window to its full Dict counterpart "
+                "(header form fields, tabs, action bar) — NOT for single action forms "
+                "(use rag_get_dict_action_view_html)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window": {
+                        "type": "string",
+                        "description": "csAppWindows.AppWindow, e.g. 'csDocsHeaders_OfficeIncomingDocsHorizontal'.",
+                    },
+                    "part": {
+                        "type": "string",
+                        "enum": ["summary", "html", "xml"],
+                        "description": "summary (parsed outline, default) | html (raw ViewHTML) | xml (raw AppWindowXML).",
+                    },
+                    "app_windows_id": {
+                        "type": "integer",
+                        "description": "Disambiguate when several csAppWindows rows share the name (default: longest ViewHTML).",
+                    },
+                },
+                "required": ["app_window"],
+            },
+        ),
+        Tool(
             name="rag_get_file",
             description="Return the content of a file under the workspace root (read-only).",
             inputSchema={
@@ -624,6 +912,7 @@ RAG_TOOL_NAMES = {
     "rag_search_components",
     "rag_get_sql_object",
     "rag_get_dict_action_view_html",
+    "rag_get_dict_window_html",
     "rag_get_file",
 }
 
@@ -674,6 +963,19 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             app_window=arguments.get("app_window", ""),
             dataset_ident=arguments.get("dataset_ident") or None,
             action_ident=arguments.get("action_ident") or None,
+        )
+        return text or "(empty)"
+
+    if name == "rag_get_dict_window_html":
+        text = get_dict_window_html(
+            connection_string,
+            app_window=arguments.get("app_window", ""),
+            part=arguments.get("part") or "summary",
+            app_windows_id=(
+                int(arguments["app_windows_id"])
+                if arguments.get("app_windows_id") is not None
+                else None
+            ),
         )
         return text or "(empty)"
 
