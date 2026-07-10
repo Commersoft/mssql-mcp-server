@@ -19,7 +19,10 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     with open(sys.argv[1], encoding="utf-8") as fh:
         query = fh.read()
-    with pyodbc.connect(CS, timeout=15) as conn:
+    # autocommit=True: bez tego pyodbc trzyma niejawna transakcje -> procedury cs* widza
+    # @@trancount=1, nie robia wlasnego rollbacku przy bledzie, a blok `with` commituje
+    # czesciowe zapisy przy wyjsciu (realny przypadek: osierocone wiersze po bledzie 515).
+    with pyodbc.connect(CS, timeout=15, autocommit=True) as conn:
         conn.setdecoding(pyodbc.SQL_CHAR, encoding="cp1250")
         conn.setdecoding(pyodbc.SQL_WCHAR, encoding="utf-16-le")
         with conn.cursor() as cursor:
