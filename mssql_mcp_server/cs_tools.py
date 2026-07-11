@@ -30,6 +30,10 @@ Tools:
                         pagingDisabled, getMetaInfo-like toggles) via minimal-U.
 - rebuild_user_rights : rebuild per-user cache (appMainMenuJSON, appWindowIdentsWithRights,
                         warehousesRights) after menu/window/privileges changes.
+- ai_tool_sync_params : sync csAIAgentsToolsParams with an AI tool procedure (upsert with
+                        the U-required-fields gotcha, heuristic $.key diff, redeploy script).
+- ng_add_lookup       : wire a lookup on an NG field (LookupDefs + Get/Set mappings with
+                        all sourceKind conventions).
 
 All tools are WRITE-CAPABLE. They run against the same connection_string as the
 read tools. Destructive safety: deploy_sql_object never drops unless csAddObjVer
@@ -1352,6 +1356,399 @@ def rebuild_user_rights(
 
 
 # ---------------------------------------------------------------------------
+# 14. ai_tool_sync_params
+# ---------------------------------------------------------------------------
+
+def ai_tool_sync_params(
+    connection_string: str,
+    tool_name: str,
+    params: Optional[Sequence[dict]] = None,
+    generate_sync_script: bool = True,
+) -> str:
+    """
+    Sync the AI tool parameter registry (csAIAgentsToolsParams) with the tool procedure.
+    Pitfalls handled:
+      - U rows MUST also carry csAIAgentsToolsG+name+type+isRequired (otherwise
+        'Proszę uzupełnić pole...' and the WHOLE batch rolls back);
+      - typeJSON is stored as a plain STRING (a dict is dumped; never json_query);
+      - isRequired coerced to int.
+    Always reports a heuristic diff: registry names vs $.keys referenced in the
+    procedure body (AI tools take @dataInput json — sys.parameters is useless here).
+    With generate_sync_script=True returns a csSysGenManagedSync redeploy script
+    for the touched params (save it to data/_sync_<Tool>_params_....sql).
+    """
+    name = (tool_name or "").strip()
+    if not name:
+        return "Error: tool_name is required."
+    short = name[4:] if name.lower().startswith("dbo.") else name
+
+    out: List[str] = []
+    touched: List[str] = []
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select csAIAgentsToolsG, name, SQLProcedure from dbo.csAIAgentsTools with(nolock) "
+                "where name = ? or SQLProcedure in (?, ?)",
+                short, short, f"dbo.{short}",
+            )
+            t = cur.fetchone()
+            if not t:
+                return f"Error: AI tool '{short}' not found in csAIAgentsTools (name/SQLProcedure)."
+            tool_g = str(t[0]).upper()
+            proc = (t[2] or "").strip()
+            out.append(f"TOOL {t[1]} | G={tool_g} | proc={proc or '(none)'}")
+
+            # --- registry state ---
+            cur.execute(
+                "select csAIAgentsToolsParamsId, csAIAgentsToolsParamsG, name, type, isRequired, "
+                "description, iif(typeJSON is null, 0, 1) "
+                "from dbo.csAIAgentsToolsParams with(nolock) where csAIAgentsToolsG = ? order by name",
+                tool_g,
+            )
+            reg = {r[2]: r for r in cur.fetchall()}
+
+            # --- heuristic diff vs proc body ($.key references in @dataInput json) ---
+            body_keys: set = set()
+            if proc:
+                body = _exec_scalar(
+                    cur,
+                    "select m.definition from sys.sql_modules m where m.object_id = object_id(?)",
+                    proc if proc.lower().startswith("dbo.") else f"dbo.{proc}",
+                )
+                if body:
+                    body_keys = set(re.findall(r"\$\.([A-Za-z_][A-Za-z0-9_]*)", body))
+
+            # --- upserts ---
+            rows: List[dict] = []
+            for p in (params or []):
+                pname = (p.get("name") or "").strip()
+                if not pname:
+                    return "Error: each param needs 'name'."
+                existing = reg.get(pname)
+                ptype = p.get("type") or (existing[3] if existing else None)
+                if not ptype:
+                    return f"Error: param '{pname}' is new — 'type' is required."
+                is_req = p.get("isRequired", existing[4] if existing else 0)
+                rec = {
+                    "_opr": "U" if existing else "I",
+                    "csAIAgentsToolsParamsG": str(existing[1]).upper() if existing else _new_guid(),
+                    # U-gotcha: required fields must ALWAYS be present, not only changed ones
+                    "csAIAgentsToolsG": tool_g,
+                    "name": pname,
+                    "type": ptype,
+                    "isRequired": _as_int(is_req),
+                }
+                if existing:
+                    rec["csAIAgentsToolsParamsId"] = int(existing[0])
+                if "description" in p:
+                    rec["description"] = p["description"]
+                tj = p.get("typeJSON")
+                if tj is not None:
+                    rec["typeJSON"] = json.dumps(tj, ensure_ascii=False) if isinstance(tj, (dict, list)) else str(tj)
+                rows.append(rec)
+                touched.append(pname)
+
+            if rows:
+                resp = _jsonsave(cur, "csAIAgentsToolsParamsJSONSave", rows)
+                if resp:
+                    return f"csAIAgentsToolsParamsJSONSave WARNING (whole batch rolled back):\n{resp}"
+                out.append(f"UPSERTED {len(rows)} param(s): "
+                           + ", ".join(f"{r['name']}({r['_opr']})" for r in rows))
+                if any("typeJSON" in r for r in rows):
+                    cur.execute(
+                        "select name, iif(typeJSON is null, 0, 1) from dbo.csAIAgentsToolsParams "
+                        "with(nolock) where csAIAgentsToolsG = ? and name in ({})".format(
+                            ",".join("?" * len(rows))),
+                        tool_g, *[r["name"] for r in rows],
+                    )
+                    for n, has in cur.fetchall():
+                        if not has and any(r["name"] == n and "typeJSON" in r for r in rows):
+                            out.append(f"WARNING: typeJSON for '{n}' is NULL after save (silent schema loss)!")
+
+                # refresh registry for the diff below
+                cur.execute(
+                    "select name from dbo.csAIAgentsToolsParams with(nolock) where csAIAgentsToolsG = ?",
+                    tool_g,
+                )
+                reg_names = {r[0] for r in cur.fetchall()}
+            else:
+                reg_names = set(reg)
+
+            out.append(f"\nREGISTRY ({len(reg_names)}): " + (", ".join(sorted(reg_names)) or "(empty)"))
+            if body_keys:
+                missing_in_reg = sorted(body_keys - reg_names)
+                unused_in_proc = sorted(reg_names - body_keys)
+                if missing_in_reg:
+                    out.append("DIFF referenced in proc body but NOT in registry (heuristic $.key scan): "
+                               + ", ".join(missing_in_reg))
+                if unused_in_proc:
+                    out.append("DIFF in registry but not referenced in proc body (heuristic): "
+                               + ", ".join(unused_in_proc))
+                if not missing_in_reg and not unused_in_proc:
+                    out.append("DIFF: registry matches proc body references.")
+
+            # --- redeploy script ---
+            if generate_sync_script and touched:
+                names_in = ",".join("''" + n.replace("'", "''''") + "''" for n in touched)
+                where_exp = f"csAIAgentsToolsG = ''{tool_g}'' and name in ({names_in})"
+                cur.execute(
+                    "declare @x xml; exec dbo.csSysGenManagedSync "
+                    "@object_name = N'csAIAgentsToolsParams', @where_exp = N'" + where_exp + "', "
+                    "@select_results = 0, @results_xml = @x out; "
+                    "select convert(nvarchar(max), @x);"
+                )
+                r = cur.fetchone()
+                script_xml = r[0] if r else None
+                if script_xml:
+                    # <ScriptLines><row><line>...</line><id>n</id></row>... -> plain text
+                    lines = re.findall(r"<line>(.*?)</line>", script_xml, flags=re.S)
+                    script = "\n".join(
+                        l.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+                        for l in lines
+                    )
+                    out.append("\nSYNC SCRIPT (save to data/_sync_" + short + "_params_....sql):\n" + script)
+                else:
+                    out.append("\nWARNING: csSysGenManagedSync returned empty script.")
+
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 15. ng_add_lookup
+# ---------------------------------------------------------------------------
+
+def ng_add_lookup(
+    connection_string: str,
+    app_window_ident: str,
+    field_ident: str,
+    lookup_window_ident: str,
+    data_set_ident: str = "main",
+    source_kind: str = "rows",
+    is_multi_select: bool = False,
+    close_kind: Optional[str] = None,
+    search_get: bool = True,
+    gets: Optional[Sequence[dict]] = None,
+    sets: Optional[Sequence[dict]] = None,
+    namespace_g: str = DEFAULT_NAMESPACE_G,
+) -> str:
+    """
+    Wire a lookup on an NG field: csNGAppWindowDataSetsLookupDefs + Get + Set mappings.
+    Conventions/pitfalls handled (verified on csSalesHeaders):
+      - DEF always gets csAppNameSpacesGLookup (INSERT without it silently breaks);
+      - every Get/Set row carries sourceKind = DEF.sourceKind (rows w/o it are ignored);
+      - source_kind='rows' (form field) vs 'where' (filter panel host; default
+        closeKind='onLostFocus');
+      - search_get auto-adds Get: host field -> searchText[where] of the lookup;
+      - Set rows default: lookup rows -> host (sourceKindTo = DEF.sourceKind);
+        dataSetIdentFrom defaults to the lookup window's FIRST dataset (may be != main);
+      - Get with 'value' -> sourceKindFrom='value' + dataFieldValueFrom (constant filter);
+      - idempotent: existing identical mappings are skipped;
+      - warns when the lookup window is missing onlyAsLookup=1 or has no sort idents.
+
+    gets: [{"from_field": .., "to_field": .., "value": .., "source_kind_from": ..,
+            "source_kind_to": ..}]  (from_field XOR value)
+    sets: [{"from_field": .., "to_field": .., "data_set_ident_from": ..,
+            "source_kind_to": ..}]
+    """
+    if source_kind not in ("rows", "where"):
+        return "Error: source_kind must be 'rows' (form field) or 'where' (filter panel)."
+    if not sets and not search_get and not gets:
+        return "Error: nothing to wire — provide sets/gets or leave search_get=True."
+
+    warnings: List[str] = []
+    log: List[str] = []
+    if close_kind is None and source_kind == "where":
+        close_kind = "onLostFocus"
+
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # --- host field must exist ---
+            fld = _exec_scalar(
+                cur,
+                "select 1 from dbo.csNGAppWindowDataSetsFields with(nolock) "
+                "where csAppNameSpacesG = ? and appWindowIdent = ? and dataSetIdent = ? and dataFieldIdent = ?",
+                namespace_g, app_window_ident, data_set_ident, field_ident,
+            ) or _exec_scalar(
+                cur,
+                "select 1 from dbo.csNGAppWindowDataSetsWhereFields with(nolock) "
+                "where csAppNameSpacesG = ? and appWindowIdent = ? and dataSetIdent = ? and dataFieldIdent = ?",
+                namespace_g, app_window_ident, data_set_ident, field_ident,
+            )
+            if not fld:
+                return (f"Error: host field '{field_ident}' not found in "
+                        f"{app_window_ident}/{data_set_ident} (Fields nor WhereFields).")
+
+            # --- lookup window checks ---
+            cur.execute(
+                "select onlyAsLookup, getMetaInfo from dbo.csNGAppWindows with(nolock) "
+                "where csAppNameSpacesG = ? and appWindowIdent = ?",
+                namespace_g, lookup_window_ident,
+            )
+            lw = cur.fetchone()
+            if not lw:
+                return f"Error: lookup window '{lookup_window_ident}' not found."
+            if not lw[0]:
+                warnings.append(f"lookup window {lookup_window_ident} has onlyAsLookup=0 "
+                                "(convention: dedicated lookup windows set it to 1 + getMetaInfo=0).")
+            lookup_ds = _exec_scalar(
+                cur,
+                "select top 1 dataSetIdent from dbo.csNGAppWindowDataSets with(nolock) "
+                "where csAppNameSpacesG = ? and appWindowIdent = ? order by ord",
+                namespace_g, lookup_window_ident,
+            ) or "main"
+            has_sort = _exec_scalar(
+                cur,
+                "select count(*) from dbo.csNGAppWindowDataSetsSortIdents with(nolock) "
+                "where csAppNameSpacesG = ? and appWindowIdent = ?",
+                namespace_g, lookup_window_ident,
+            )
+            if not has_sort:
+                warnings.append(f"lookup window {lookup_window_ident} has NO sort idents "
+                                "(REQUIRED for lookup windows — paging is unstable without it).")
+
+            # --- DEF upsert ---
+            cur.execute(
+                "select csNGAppWindowDataSetsLookupDefsId, csNGAppWindowDataSetsLookupDefsG "
+                "from dbo.csNGAppWindowDataSetsLookupDefs with(nolock) "
+                "where csAppNameSpacesG = ? and appWindowIdent = ? and dataSetIdent = ? and dataFieldIdent = ?",
+                namespace_g, app_window_ident, data_set_ident, field_ident,
+            )
+            d = cur.fetchone()
+            def_row = {
+                "_opr": "U" if d else "I",
+                "csNGAppWindowDataSetsLookupDefsG": str(d[1]).upper() if d else _new_guid(),
+                "csAppNameSpacesG": namespace_g,
+                "appWindowIdent": app_window_ident,
+                "dataSetIdent": data_set_ident,
+                "dataFieldIdent": field_ident,
+                "appWindowIdentLookup": lookup_window_ident,
+                "csAppNameSpacesGLookup": namespace_g,  # pitfall: INSERT without it silently breaks
+                "sourceKind": source_kind,
+                "isMultiSelect": _as_int(is_multi_select),
+            }
+            if close_kind:
+                def_row["closeKind"] = close_kind
+            if d:
+                def_row["csNGAppWindowDataSetsLookupDefsId"] = int(d[0])
+            resp = _jsonsave(cur, "csNGAppWindowDataSetsLookupDefsJSONSave", [def_row])
+            if resp:
+                return f"LookupDefs JSONSave WARNING:\n{resp}"
+            log.append(f"DEF {field_ident} -> {lookup_window_ident} ({'U' if d else 'I'}, "
+                       f"sourceKind={source_kind})")
+
+            # --- GET rows ---
+            get_rows: List[dict] = []
+            if search_get:
+                get_rows.append({
+                    "from_field": field_ident, "to_field": "searchText",
+                    "source_kind_from": source_kind, "source_kind_to": "where",
+                })
+            for g in (gets or []):
+                get_rows.append(dict(g))
+
+            n_get = 0
+            for g in get_rows:
+                from_field = g.get("from_field")
+                value = g.get("value")
+                if (from_field is None) == (value is None):
+                    return f"Error: Get mapping needs exactly one of from_field/value: {g}"
+                sk_from = g.get("source_kind_from") or ("value" if value is not None else source_kind)
+                sk_to = g.get("source_kind_to") or "where"
+                to_field = g.get("to_field")
+                if not to_field:
+                    return f"Error: Get mapping needs to_field: {g}"
+                ds_from = g.get("data_set_ident_from") or data_set_ident
+                ds_to = g.get("data_set_ident_to") or lookup_ds
+                exists = _exec_scalar(
+                    cur,
+                    "select 1 from dbo.csNGAppWindowDataSetsLookupDefsGet with(nolock) "
+                    "where csAppNameSpacesG = ? and appWindowIdent = ? and dataSetIdent = ? "
+                    "and dataFieldIdent = ? and isnull(dataFieldIdentFrom, N'') = ? "
+                    "and dataFieldIdentTo = ? and isnull(dataFieldValueFrom, N'') = ? "
+                    "and sourceKindFrom = ? and sourceKindTo = ?",
+                    namespace_g, app_window_ident, data_set_ident, field_ident,
+                    from_field or "", to_field, "" if value is None else str(value), sk_from, sk_to,
+                )
+                if exists:
+                    log.append(f"GET {from_field or value!r} -> {to_field} already exists (skip)")
+                    continue
+                rec = {
+                    "_opr": "I",
+                    "csNGAppWindowDataSetsLookupDefsGetG": _new_guid(),
+                    "csAppNameSpacesG": namespace_g,
+                    "appWindowIdent": app_window_ident,
+                    "dataSetIdent": data_set_ident,
+                    "dataFieldIdent": field_ident,
+                    "dataSetIdentFrom": ds_from,
+                    "dataSetIdentTo": ds_to,
+                    "dataFieldIdentTo": to_field,
+                    "sourceKindFrom": sk_from,
+                    "sourceKindTo": sk_to,
+                    "sourceKind": source_kind,  # pitfall: rows without sourceKind are ignored
+                }
+                if from_field is not None:
+                    rec["dataFieldIdentFrom"] = from_field
+                if value is not None:
+                    rec["dataFieldValueFrom"] = str(value)
+                resp = _jsonsave(cur, "csNGAppWindowDataSetsLookupDefsGetJSONSave", [rec])
+                if resp:
+                    return f"LookupDefsGet JSONSave WARNING (after {n_get} gets):\n{resp}"
+                n_get += 1
+                log.append(f"GET {from_field or ('value ' + str(value))} [{sk_from}] -> {to_field} [{sk_to}]")
+
+            # --- SET rows ---
+            n_set = 0
+            for s in (sets or []):
+                from_field = s.get("from_field")
+                to_field = s.get("to_field") or from_field
+                if not from_field:
+                    return f"Error: Set mapping needs from_field: {s}"
+                ds_from = s.get("data_set_ident_from") or lookup_ds
+                sk_to = s.get("source_kind_to") or source_kind
+                exists = _exec_scalar(
+                    cur,
+                    "select 1 from dbo.csNGAppWindowDataSetsLookupDefsSet with(nolock) "
+                    "where csAppNameSpacesG = ? and appWindowIdent = ? and dataSetIdent = ? "
+                    "and dataFieldIdent = ? and dataFieldIdentFrom = ? and dataFieldIdentTo = ? "
+                    "and sourceKindTo = ?",
+                    namespace_g, app_window_ident, data_set_ident, field_ident,
+                    from_field, to_field, sk_to,
+                )
+                if exists:
+                    log.append(f"SET {from_field} -> {to_field} already exists (skip)")
+                    continue
+                rec = {
+                    "_opr": "I",
+                    "csNGAppWindowDataSetsLookupDefsSetG": _new_guid(),
+                    "csAppNameSpacesG": namespace_g,
+                    "appWindowIdent": app_window_ident,
+                    "dataSetIdent": data_set_ident,
+                    "dataFieldIdent": field_ident,
+                    "dataSetIdentFrom": ds_from,
+                    "dataFieldIdentFrom": from_field,
+                    "dataSetIdentTo": s.get("data_set_ident_to") or data_set_ident,
+                    "dataFieldIdentTo": to_field,
+                    "sourceKindFrom": s.get("source_kind_from") or "rows",
+                    "sourceKindTo": sk_to,
+                    "sourceKind": source_kind,
+                }
+                resp = _jsonsave(cur, "csNGAppWindowDataSetsLookupDefsSetJSONSave", [rec])
+                if resp:
+                    return f"LookupDefsSet JSONSave WARNING (after {n_set} sets):\n{resp}"
+                n_set += 1
+                log.append(f"SET {from_field} [{ds_from}] -> {to_field} [{sk_to}]")
+
+    msg = (f"OK: lookup {app_window_ident}/{data_set_ident}/{field_ident} -> {lookup_window_ident} "
+           f"(+{n_get} get, +{n_set} set).\n  " + "\n  ".join(log))
+    if not sets:
+        warnings.append("no Set mappings — the lookup will open but select nothing back; "
+                        "add sets like [{'from_field': 'csXId'}, {'from_field': 'XDesc'}].")
+    if warnings:
+        msg += "\nWARNINGS:\n  - " + "\n  - ".join(warnings)
+    return msg
+
+
+# ---------------------------------------------------------------------------
 # MCP tool descriptors + dispatcher
 # ---------------------------------------------------------------------------
 
@@ -1369,6 +1766,8 @@ CS_TOOL_NAMES = {
     "ng_set_stmsql",
     "ng_set_dataset_props",
     "rebuild_user_rights",
+    "ai_tool_sync_params",
+    "ng_add_lookup",
 }
 
 
@@ -1651,6 +2050,64 @@ def tool_descriptors():
                 },
             },
         ),
+        Tool(
+            name="ai_tool_sync_params",
+            description=(
+                "Sync the AI tool parameter registry (csAIAgentsToolsParams): upsert params "
+                "(handles the U-batch-rollback gotcha — required fields always re-sent; "
+                "typeJSON stored as plain string), heuristic diff registry vs $.keys in the "
+                "procedure body, and a csSysGenManagedSync redeploy script for data/."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "tool_name": {"type": "string", "description": "csAIAgentsTools.name or SQLProcedure (with/without dbo.)."},
+                    "params": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "[{name, type, description, isRequired, typeJSON}] — upserted by name. Omit to only get the diff report. typeJSON may be an object (auto-dumped to string).",
+                    },
+                    "generate_sync_script": {"type": "boolean", "description": "Return csSysGenManagedSync script for touched params (default true)."},
+                },
+                "required": ["tool_name"],
+            },
+        ),
+        Tool(
+            name="ng_add_lookup",
+            description=(
+                "Wire a lookup on an NG field: LookupDefs + Get/Set mappings. Handles all "
+                "conventions: csAppNameSpacesGLookup on INSERT, sourceKind on every Get/Set "
+                "row (silently ignored otherwise), source_kind='rows' (form) vs 'where' "
+                "(filter panel host, auto closeKind=onLostFocus), auto Get host->searchText, "
+                "Set dataSetIdentFrom = lookup's first dataset. Idempotent. Warns about "
+                "missing onlyAsLookup/sort idents on the lookup window."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string"},
+                    "field_ident": {"type": "string", "description": "Host field (Fields or WhereFields), usually *Desc."},
+                    "lookup_window_ident": {"type": "string", "description": "e.g. csCustomersLookup."},
+                    "data_set_ident": {"type": "string", "description": "Default 'main'."},
+                    "source_kind": {"type": "string", "description": "'rows' (form field, default) or 'where' (filter panel host)."},
+                    "is_multi_select": {"type": "boolean"},
+                    "close_kind": {"type": "string", "description": "e.g. 'onLostFocus' (auto for source_kind='where')."},
+                    "search_get": {"type": "boolean", "description": "Auto-add Get: host field -> searchText (default true)."},
+                    "gets": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Extra Get mappings: [{from_field XOR value, to_field, source_kind_from?, source_kind_to?}]. value -> constant filter (e.g. isSupplier=1).",
+                    },
+                    "sets": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Set mappings (lookup row -> host): [{from_field, to_field? (default =from_field), data_set_ident_from?, source_kind_to?}]. Typically Id + Desc pair.",
+                    },
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident", "field_ident", "lookup_window_ident"],
+            },
+        ),
     ]
 
 
@@ -1793,6 +2250,30 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             cs_companies_id=int(cid) if cid is not None else None,
             cs_usr_id=int(uid) if uid is not None else None,
             confirm_all=bool(arguments.get("confirm_all", False)),
+        )
+
+    if name == "ai_tool_sync_params":
+        return ai_tool_sync_params(
+            connection_string,
+            tool_name=arguments.get("tool_name", ""),
+            params=arguments.get("params"),
+            generate_sync_script=bool(arguments.get("generate_sync_script", True)),
+        )
+
+    if name == "ng_add_lookup":
+        return ng_add_lookup(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            field_ident=arguments.get("field_ident", ""),
+            lookup_window_ident=arguments.get("lookup_window_ident", ""),
+            data_set_ident=arguments.get("data_set_ident") or "main",
+            source_kind=arguments.get("source_kind") or "rows",
+            is_multi_select=bool(arguments.get("is_multi_select", False)),
+            close_kind=arguments.get("close_kind"),
+            search_get=bool(arguments.get("search_get", True)),
+            gets=arguments.get("gets"),
+            sets=arguments.get("sets"),
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
         )
 
     raise ValueError(f"Unknown cs tool: {name}")
