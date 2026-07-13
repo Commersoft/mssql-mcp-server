@@ -34,8 +34,20 @@ Tools:
                         the U-required-fields gotcha, heuristic $.key diff, redeploy script).
 - ng_add_lookup       : wire a lookup on an NG field (LookupDefs + Get/Set mappings with
                         all sourceKind conventions).
+- describe            : compact schema of a DB object — table/view columns (type/null/PK/FK)
+                        or procedure/function parameters (avoids 'Invalid column name' guessing).
+- sql_grep           : case-insensitive substring search over SQL object bodies
+                        (object:line:content, like Grep over files).
+- ng_preview_dataset  : dry-run an NG dataset — expand /*FIELDS*/ + stmSQL into the real data
+                        SELECT and execute it (top N), catching reserved-word/invalid-column/
+                        @var runtime errors the config-only validator misses.
+- ng_bulk_layout      : bulk upsert grid layout columns (visible/ord/width/group) in one call.
+- ng_register_translates : register gT() idents (reuse csTranslate by content/GUID or create).
+- ng_add_linked_window : master->detail link (csNGAppWindowsLinks + LinksFields + optional
+                        tabIdent where-field) in one call.
+- ng_add_filter       : filter-panel where-field + optional lookup + watermark in one call.
 
-All tools are WRITE-CAPABLE. They run against the same connection_string as the
+All tools are WRITE-CAPABLE (except describe/sql_grep/ng_preview_dataset — read-only). They run against the same connection_string as the
 read tools. Destructive safety: deploy_sql_object never drops unless csAddObjVer
 returns @drop=1; orphan cleanup only flips inProgress=0 (never DELETE).
 """
@@ -1749,6 +1761,583 @@ def ng_add_lookup(
 
 
 # ---------------------------------------------------------------------------
+# 16. describe — table columns (type/null/PK/FK) or proc/function parameters
+# ---------------------------------------------------------------------------
+
+def describe(connection_string: str, object_name: str) -> str:
+    """Compact schema of a DB object: columns (type/null/PK/FK) for a table/view,
+    or the parameter list for a procedure/function. Eliminates the round-trips
+    of guessing column names (repeated 'Invalid column name')."""
+    name = object_name.split(".")[-1].strip("[]")
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            row = cur.execute(
+                "select o.type, o.type_desc from sys.objects o where o.object_id = object_id(?)",
+                name,
+            ).fetchone()
+            if not row:
+                return f"Error: object '{name}' not found."
+            otype = (row[0] or "").strip()
+
+            if otype in ("U", "V"):
+                cur.execute(
+                    "select c.name, t.name, c.max_length, c.precision, c.scale, c.is_nullable, c.is_identity, "
+                    "  isnull(pk.is_pk,0), fk.ref "
+                    "from sys.columns c "
+                    "  join sys.types t on t.user_type_id = c.user_type_id "
+                    "  outer apply (select max(cast(i.is_primary_key as int)) is_pk "
+                    "    from sys.index_columns xc join sys.indexes i on i.object_id=xc.object_id and i.index_id=xc.index_id "
+                    "    where xc.object_id=c.object_id and xc.column_id=c.column_id and i.is_primary_key=1) pk "
+                    "  outer apply (select top 1 rt.name + N'.' + rc.name ref "
+                    "    from sys.foreign_key_columns f "
+                    "      join sys.objects rt on rt.object_id=f.referenced_object_id "
+                    "      join sys.columns rc on rc.object_id=f.referenced_object_id and rc.column_id=f.referenced_column_id "
+                    "    where f.parent_object_id=c.object_id and f.parent_column_id=c.column_id) fk "
+                    "where c.object_id = object_id(?) order by c.column_id",
+                    name,
+                )
+                lines = []
+                for r in cur.fetchall():
+                    cname, ctype, mlen, prec, scale, nullable, ident, is_pk, ref = r
+                    typ = ctype
+                    if ctype in ("nvarchar", "nchar", "varchar", "char", "varbinary", "binary"):
+                        typ += "(max)" if mlen == -1 else f"({mlen // 2 if ctype.startswith('n') and mlen != -1 else mlen})"
+                    elif ctype in ("decimal", "numeric"):
+                        typ += f"({prec},{scale})"
+                    flags = []
+                    if is_pk:
+                        flags.append("PK")
+                    if ident:
+                        flags.append("identity")
+                    flags.append("NULL" if nullable else "NOT NULL")
+                    if ref:
+                        flags.append(f"-> {ref}")
+                    lines.append(f"  {cname} | {typ} {' '.join(flags)}")
+                if not lines:
+                    return f"{name} ({row[1]}): no columns."
+                return f"TABLE {name} ({len(lines)} cols):\n" + "\n".join(lines)
+
+            # procedure / function
+            cur.execute(
+                "select p.name, t.name, p.max_length, p.precision, p.scale, p.is_output "
+                "from sys.parameters p join sys.types t on t.user_type_id = p.user_type_id "
+                "where p.object_id = object_id(?) order by p.parameter_id",
+                name,
+            )
+            lines = []
+            for r in cur.fetchall():
+                pname, ptype, mlen, prec, scale, is_out = r
+                typ = ptype
+                if ptype in ("nvarchar", "nchar", "varchar", "char"):
+                    typ += "(max)" if mlen == -1 else f"({mlen // 2 if ptype.startswith('n') and mlen != -1 else mlen})"
+                elif ptype in ("decimal", "numeric"):
+                    typ += f"({prec},{scale})"
+                lines.append(f"  {pname or '(returns)'} {typ}{' out' if is_out else ''}")
+            head = f"{row[1]} {name} ({len(lines)} params):"
+            return head + ("\n" + "\n".join(lines) if lines else " (no parameters)")
+
+
+# ---------------------------------------------------------------------------
+# 17. sql_grep — grep over SQL object bodies (object:line:content)
+# ---------------------------------------------------------------------------
+
+def sql_grep(connection_string: str, pattern: str, name_like: Optional[str] = None,
+             top: int = 100) -> str:
+    """Case-insensitive substring search over sys.sql_modules bodies. Returns
+    object:line:trimmed-line hits (like Grep over files). Optional name_like
+    narrows candidate objects. Replaces ad-hoc LIKE-on-sql_modules + substring."""
+    if not pattern:
+        return "Error: pattern is required."
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            sql = ("select o.name, o.type, m.definition from sys.sql_modules m "
+                   "join sys.objects o on o.object_id = m.object_id "
+                   "where m.definition like ? escape '\\'")
+            like = "%" + pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            params = [like]
+            if name_like:
+                sql += " and o.name like ?"
+                params.append("%" + name_like + "%")
+            sql += " order by o.name"
+            cur.execute(sql, *params)
+            needle = pattern.lower()
+            hits: List[str] = []
+            truncated = False
+            for oname, otype, definition in cur.fetchall():
+                for i, line in enumerate((definition or "").splitlines(), start=1):
+                    if needle in line.lower():
+                        hits.append(f"{oname}:{i}: {line.strip()[:200]}")
+                        if len(hits) >= top:
+                            truncated = True
+                            break
+                if truncated:
+                    break
+    if not hits:
+        return f"No matches for '{pattern}'" + (f" in objects like '{name_like}'." if name_like else ".")
+    out = "\n".join(hits)
+    if truncated:
+        out += f"\n... (truncated at {top} hits — narrow with name_like or a longer pattern)"
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 18. ng_preview_dataset — run the REAL NG data SELECT (dry-run), catch runtime SQL errors
+# ---------------------------------------------------------------------------
+
+def ng_preview_dataset(connection_string: str, app_window_ident: str,
+                       data_set_ident: str = "main", where: Optional[str] = None,
+                       top: int = 5, cs_companies_id: Optional[int] = None,
+                       cs_usr_id: Optional[int] = None,
+                       namespace_g: str = DEFAULT_NAMESPACE_G) -> str:
+    """Dry-run an NG dataset the way the runtime does: expand /*FIELDS*/ + stmSQL
+    template into the real data SELECT and EXECUTE it (top N, for json). Catches
+    reserved-word/invalid-column/@var errors that csNGValidateWindowForAI (config-only)
+    misses. Returns the generated SQL + first rows, or the SQL + the exact error."""
+    top = max(1, min(int(top or 5), 50))
+    cid = str(int(cs_companies_id)) if cs_companies_id is not None else "(select min(csCompaniesId) from dbo.csCompanies)"
+    uid = str(int(cs_usr_id)) if cs_usr_id is not None else "(select min(csUsrId) from dbo.csUsr)"
+    ns = namespace_g.replace("'", "''")
+    aw = app_window_ident.replace("'", "''")
+    ds = data_set_ident.replace("'", "''")
+
+    build = f"""set nocount on;
+declare @stmSQL nvarchar(max), @stmSQLPrepare nvarchar(max), @fields nvarchar(max),
+ @stmSQLOut nvarchar(max)=N'', @prepOut nvarchar(max)=N'', @paramsPrepare nvarchar(max), @useManual bit,
+ @ch nvarchar(2)=char(13)+char(10), @suffix nvarchar(2)=N'PL',
+ @cid bigint, @uid bigint, @cidStr nvarchar(30), @uidStr nvarchar(30),
+ @where nvarchar(max)=?, @pd nvarchar(max)=dbo.csFnNGAPIGetDataStmParamDef();
+set @cid = {cid};
+set @uid = {uid};
+set @cidStr = cast(@cid as nvarchar(30));
+set @uidStr = cast(@uid as nvarchar(30));
+select @stmSQL=stmSQL,@stmSQLPrepare=stmSQLPrepare,@fields=fields from dbo.csNGAppWindowDataSets with(nolock)
+ where csAppNameSpacesG=N'{ns}' and appWindowIdent=N'{aw}' and dataSetIdent=N'{ds}';
+if @stmSQL is null begin select cast(null as nvarchar(max)) g, cast(null as nvarchar(max)) p, N'DATASET_NOT_FOUND' e; return; end;
+set @fields=replace(isnull(@fields,N''),N'/*LANGUAGE_SUFFIX*/',@suffix);
+set @stmSQL=replace(replace(@stmSQL,N'/*FIELDS*/',@fields),N'/*LANGUAGE_SUFFIX*/',@suffix);
+if @stmSQLPrepare is not null and @stmSQLPrepare<>N'' begin
+ set @stmSQLPrepare=replace(@stmSQLPrepare,N'/*LANGUAGE_SUFFIX*/',@suffix);
+ exec sp_executesql @stmSQLPrepare,@pd,@sessionId=null,@route=null,@kind=null,@ch=@ch,@pageNo=1,@pageSize={top},
+  @where=@where,@whereLists=null,@layout=null,@order=null,@params=null,@csCompaniesId=@cid,@csUsrId=@uid,
+  @csB2BPortalsId=null,@csNGMasterMenuDefId=null,@csAppMainMenusId=null,@languageSuffix=@suffix,@paramsJSON=null,
+  @paramsJSONAdd=null,@paramsJSONSession=null,@csCompaniesIdStr=@cidStr,@csUsrIdStr=@uidStr,
+  @csB2BPortalsIdStr=null,@csNGMasterMenuDefIdStr=null,@csAppMainMenusIdStr=null,@stmSQLOut=@prepOut out,
+  @selectedRows=null,@filter=null,@advancedFilters=null,@isRefreshOneRecord=0,@csAppNameSpacesG=N'{ns}',
+  @appWindowIdent=N'{aw}',@dataSetIdent=N'{ds}',@paramsPrepare=@paramsPrepare out,@useManualAggregateFields=@useManual out;
+end;
+exec sp_executesql @stmSQL,@pd,@sessionId=null,@route=null,@kind=2,@ch=@ch,@pageNo=1,@pageSize={top},
+ @where=@where,@whereLists=null,@layout=null,@order=null,@params=null,@csCompaniesId=@cid,@csUsrId=@uid,
+ @csB2BPortalsId=null,@csNGMasterMenuDefId=null,@csAppMainMenusId=null,@languageSuffix=@suffix,@paramsJSON=null,
+ @paramsJSONAdd=null,@paramsJSONSession=null,@csCompaniesIdStr=@cidStr,@csUsrIdStr=@uidStr,
+ @csB2BPortalsIdStr=null,@csNGMasterMenuDefIdStr=null,@csAppMainMenusIdStr=null,@stmSQLOut=@stmSQLOut out,
+ @selectedRows=null,@filter=null,@advancedFilters=null,@isRefreshOneRecord=0,@csAppNameSpacesG=N'{ns}',
+ @appWindowIdent=N'{aw}',@dataSetIdent=N'{ds}',@paramsPrepare=@paramsPrepare out,@useManualAggregateFields=@useManual out;
+select @stmSQLOut g, @prepOut p, cast(null as nvarchar(max)) e;"""
+
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(build, where)
+                row = cur.fetchone()
+            except Exception as e:  # noqa: BLE001
+                return f"BUILD ERROR (stmSQL template failed to compose):\n{e}"
+            if not row or (row[2] == "DATASET_NOT_FOUND"):
+                return f"Error: dataset {app_window_ident}/{data_set_ident} not found in namespace."
+            generated = row[0] or ""
+            prep = row[1] or ""
+            if not generated.strip():
+                return "Error: stmSQL produced empty SQL (dataset has no stmSQL?)."
+
+            run = (f"set nocount on;\n{prep}\nselect top {top} * from (\n{generated}\n) __dry "
+                   "for json path, include_null_values")
+            try:
+                cur.execute(run)
+                res = cur.fetchone()
+                rows_json = res[0] if res and res[0] else "[]"
+            except Exception as e:  # noqa: BLE001
+                return (f"RUNTIME SQL ERROR — the window would fail with this on open:\n{e}\n\n"
+                        f"--- generated data SQL ---\n{generated}")
+
+    preview = rows_json if len(rows_json) <= 4000 else rows_json[:4000] + " …(truncated)"
+    return (f"OK: dataset {app_window_ident}/{data_set_ident} executes cleanly (top {top}).\n"
+            f"--- rows (json) ---\n{preview}\n\n--- generated data SQL ---\n{generated}")
+
+
+# ---------------------------------------------------------------------------
+# 19. ng_bulk_layout — set visibility/order/width/group for many columns in one call
+# ---------------------------------------------------------------------------
+
+def ng_bulk_layout(connection_string: str, app_window_ident: str, columns: Sequence[dict],
+                   data_set_ident: str = "main", layout_ident: str = "default",
+                   namespace_g: str = DEFAULT_NAMESPACE_G) -> str:
+    """Bulk upsert of grid layout columns. Each item: {field, visible?, ord?, width?, group?}.
+    Same pitfalls as ng_set_layout_col (minimal-U, int isVisible, non-null width on INSERT,
+    group existence check) but one connection + one MCP call for the whole grid."""
+    if not columns:
+        return "Error: columns list is required."
+    log: List[str] = []
+    warnings: List[str] = []
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            known_groups: dict = {}
+            for item in columns:
+                field = item.get("field")
+                if not field:
+                    return f"Error: each column needs 'field': {item}"
+                changes: dict = {}
+                if "width" in item and item["width"] is not None:
+                    changes["width"] = float(item["width"])
+                if "visible" in item and item["visible"] is not None:
+                    changes["isVisible"] = _as_int(item["visible"])
+                if "ord" in item and item["ord"] is not None:
+                    changes["ord"] = int(item["ord"])
+                if "group" in item:
+                    grp = item["group"]
+                    changes["colsGroupIdent"] = grp if grp else None
+                    if grp and grp not in known_groups:
+                        known_groups[grp] = _exec_scalar(
+                            cur,
+                            "select 1 from dbo.csNGAppWindowColsGroups with(nolock) "
+                            "where csAppNameSpacesG=? and appWindowIdent=? and colsGroupIdent=?",
+                            namespace_g, app_window_ident, grp,
+                        )
+                        if not known_groups[grp]:
+                            warnings.append(f"cols group '{grp}' does not exist (create via ng_upsert_cols_group).")
+                if not changes:
+                    continue
+                cur.execute(
+                    "select csNGAppWindowDataSetsLayoutsColsId, csNGAppWindowDataSetsLayoutsColsG "
+                    "from dbo.csNGAppWindowDataSetsLayoutsCols with(nolock) "
+                    "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and layoutIdent=? and dataFieldIdent=?",
+                    namespace_g, app_window_ident, data_set_ident, layout_ident, field,
+                )
+                lc = cur.fetchone()
+                if lc:
+                    rec = {"_opr": "U",
+                           "csNGAppWindowDataSetsLayoutsColsId": int(lc[0]),
+                           "csNGAppWindowDataSetsLayoutsColsG": str(lc[1]).upper()}
+                    rec.update(changes)
+                    mode = "U"
+                else:
+                    fld = _exec_scalar(
+                        cur,
+                        "select 1 from dbo.csNGAppWindowDataSetsFields with(nolock) "
+                        "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and dataFieldIdent=?",
+                        namespace_g, app_window_ident, data_set_ident, field,
+                    )
+                    if not fld:
+                        warnings.append(f"field '{field}' not found — skipped (add via add_ng_field).")
+                        continue
+                    rec = {"_opr": "I",
+                           "csNGAppWindowDataSetsLayoutsColsG": _new_guid(),
+                           "csAppNameSpacesG": namespace_g,
+                           "appWindowIdent": app_window_ident,
+                           "dataSetIdent": data_set_ident,
+                           "layoutIdent": layout_ident,
+                           "dataFieldIdent": field,
+                           "labelDataSetIdent": data_set_ident,
+                           "labelDataFieldIdent": field}
+                    rec.update(changes)
+                    if "width" not in changes:
+                        rec["width"] = 120.0
+                    mode = "I"
+                resp = _jsonsave(cur, "csNGAppWindowDataSetsLayoutsColsJSONSave", [rec])
+                if resp:
+                    return f"JSONSave WARNING at field '{field}' (after {len(log)} ok):\n{resp}"
+                log.append(f"{mode} {field} {changes}")
+    msg = f"OK: ng_bulk_layout {app_window_ident}/{data_set_ident} — {len(log)} column(s) applied."
+    if log:
+        msg += "\n  " + "\n  ".join(log)
+    if warnings:
+        msg += "\nWARNINGS:\n  - " + "\n  - ".join(warnings)
+    return msg
+
+
+# ---------------------------------------------------------------------------
+# 20. ng_register_translates — register gT idents (reuse csTranslate by content)
+# ---------------------------------------------------------------------------
+
+def ng_register_translates(connection_string: str, app_window_ident: str,
+                           translates: Sequence[dict],
+                           namespace_g: str = DEFAULT_NAMESPACE_G) -> str:
+    """Register gT() idents on a window (csNGAppWindowTranslates). Each item:
+    {ident, cs_translate_g?} to reuse an existing translation, OR {ident, PL, EN, ...}
+    to reuse-by-content (match Content_PL+Content_EN) or create a new csTranslate.
+    Idempotent on (appWindowIdent, translateIdent)."""
+    if not translates:
+        return "Error: translates list is required."
+    log: List[str] = []
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            for item in translates:
+                ident = item.get("ident")
+                if not ident:
+                    return f"Error: each item needs 'ident': {item}"
+                tg = item.get("cs_translate_g")
+                texts = {k: v for k, v in item.items() if k in NG_COLSGROUP_LANGS}
+                if not tg:
+                    pl = texts.get("PL")
+                    en = texts.get("EN")
+                    if pl:
+                        tg = _exec_scalar(
+                            cur,
+                            "select top 1 csTranslateG from dbo.csTranslate with(nolock) "
+                            "where Content_PL = ? and isnull(Content_EN,N'') = isnull(?,N'')",
+                            pl, en,
+                        )
+                    if not tg:
+                        if not pl:
+                            return f"Error: '{ident}' has no cs_translate_g and no PL text to create/reuse."
+                        tg = _new_guid()
+                        trow = {"_opr": "I", "csTranslateG": tg}
+                        for lang, val in texts.items():
+                            trow[f"Content_{lang}"] = val
+                        resp = _jsonsave(cur, "csTranslateJSONSave", [trow])
+                        if resp:
+                            return f"csTranslateJSONSave WARNING for '{ident}':\n{resp}"
+                        action = "created csTranslate"
+                    else:
+                        action = "reused by content"
+                else:
+                    tg = str(tg).upper()
+                    action = "reused by GUID"
+                existing = _exec_scalar(
+                    cur,
+                    "select csNGAppWindowTranslatesG from dbo.csNGAppWindowTranslates with(nolock) "
+                    "where csAppNameSpacesG=? and appWindowIdent=? and translateIdent=?",
+                    namespace_g, app_window_ident, ident,
+                )
+                link = {
+                    "_opr": "U" if existing else "I",
+                    "csNGAppWindowTranslatesG": str(existing).upper() if existing else _new_guid(),
+                    "csAppNameSpacesG": namespace_g,
+                    "appWindowIdent": app_window_ident,
+                    "translateIdent": ident,
+                    "csTranslateG": str(tg).upper(),
+                }
+                resp = _jsonsave(cur, "csNGAppWindowTranslatesJSONSave", [link])
+                if resp:
+                    return f"csNGAppWindowTranslatesJSONSave WARNING for '{ident}':\n{resp}"
+                log.append(f"{ident} -> {tg} ({action}, {'U' if existing else 'I'})")
+    return f"OK: registered {len(log)} translate ident(s) on {app_window_ident}.\n  " + "\n  ".join(log)
+
+
+# ---------------------------------------------------------------------------
+# 21. ng_add_linked_window — master->detail link (bottom/side panel) in one call
+# ---------------------------------------------------------------------------
+
+def ng_add_linked_window(connection_string: str, app_window_ident_from: str,
+                         app_window_ident_to: str, placement: str,
+                         map_fields: Sequence[dict], ord: int = 1,
+                         labels: Optional[dict] = None, tab_default: Optional[str] = None,
+                         namespace_g: str = DEFAULT_NAMESPACE_G) -> str:
+    """Link a detail window to a master (csNGAppWindowsLinks + LinksFields). map_fields:
+    [{from, to?}] (from = master main field, to = detail where-field; default to=from).
+    placement: 'bottom-panel'|'outer-side-panel'|'side-panel'|'inner-side-panel'.
+    Optional tab_default sets the master where-field 'tabIdent-<placement>' (needed when a
+    placement holds several tabs). labels: {'PL':..,'EN':..} for the tab caption. The
+    linkedWindows cache rebuilds automatically via csNGAppWindowsLinksJSONSave."""
+    if not map_fields:
+        return "Error: map_fields is required (at least the master key mapping)."
+    labels = labels or {}
+    log: List[str] = []
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select csNGAppWindowsLinksG from dbo.csNGAppWindowsLinks with(nolock) "
+                "where csAppNameSpacesGFrom=? and appWindowIdentFrom=? and csAppNameSpacesGTo=? and appWindowIdentTo=?",
+                namespace_g, app_window_ident_from, namespace_g, app_window_ident_to,
+            )
+            ex = cur.fetchone()
+            link = {
+                "_opr": "U" if ex else "I",
+                "csNGAppWindowsLinksG": str(ex[0]).upper() if ex else _new_guid(),
+                "csAppNameSpacesGFrom": namespace_g,
+                "appWindowIdentFrom": app_window_ident_from,
+                "csAppNameSpacesGTo": namespace_g,
+                "appWindowIdentTo": app_window_ident_to,
+                "placement": placement,
+                "ord": int(ord),
+            }
+            for lang, val in labels.items():
+                if lang in NG_COLSGROUP_LANGS:
+                    link[f"appWindowLinkDesc_{lang}"] = val
+            resp = _jsonsave(cur, "csNGAppWindowsLinksJSONSave", [link])
+            if resp:
+                return f"csNGAppWindowsLinksJSONSave WARNING:\n{resp}"
+            log.append(f"LINK {app_window_ident_from} -> {app_window_ident_to} [{placement}] ord={ord}")
+
+            for m in map_fields:
+                ff = m.get("from")
+                if not ff:
+                    return f"Error: map_fields item needs 'from': {m}"
+                ft = m.get("to") or ff
+                exf = _exec_scalar(
+                    cur,
+                    "select csNGAppWindowsLinksFieldsG from dbo.csNGAppWindowsLinksFields with(nolock) "
+                    "where csAppNameSpacesGFrom=? and appWindowIdentFrom=? and csAppNameSpacesGTo=? and appWindowIdentTo=? "
+                    "and dataFieldIdentFrom=? and dataFieldIdentTo=?",
+                    namespace_g, app_window_ident_from, namespace_g, app_window_ident_to, ff, ft,
+                )
+                if exf:
+                    log.append(f"  MAP {ff} -> {ft} exists (skip)")
+                    continue
+                rec = {
+                    "_opr": "I",
+                    "csNGAppWindowsLinksFieldsG": _new_guid(),
+                    "csAppNameSpacesGFrom": namespace_g,
+                    "appWindowIdentFrom": app_window_ident_from,
+                    "csAppNameSpacesGTo": namespace_g,
+                    "appWindowIdentTo": app_window_ident_to,
+                    "dataSetIdentFrom": m.get("data_set_ident_from") or "main",
+                    "sourceKindFrom": m.get("source_kind_from") or "rows",
+                    "dataFieldIdentFrom": ff,
+                    "dataSetIdentTo": m.get("data_set_ident_to") or "main",
+                    "dataFieldIdentTo": ft,
+                }
+                resp = _jsonsave(cur, "csNGAppWindowsLinksFieldsJSONSave", [rec])
+                if resp:
+                    return f"csNGAppWindowsLinksFieldsJSONSave WARNING (map {ff}):\n{resp}"
+                log.append(f"  MAP {ff} -> {ft}")
+
+            if tab_default:
+                tab_field = f"tabIdent-{placement}"
+                exw = _exec_scalar(
+                    cur,
+                    "select csNGAppWindowDataSetsWhereFieldsG from dbo.csNGAppWindowDataSetsWhereFields with(nolock) "
+                    "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=N'main' and dataFieldIdent=?",
+                    namespace_g, app_window_ident_from, tab_field,
+                )
+                wrec = {
+                    "_opr": "U" if exw else "I",
+                    "csNGAppWindowDataSetsWhereFieldsG": str(exw).upper() if exw else _new_guid(),
+                    "csAppNameSpacesG": namespace_g,
+                    "appWindowIdent": app_window_ident_from,
+                    "dataSetIdent": "main",
+                    "dataFieldIdent": tab_field,
+                    "formatType": "string",
+                    "SQLBaseType": "nvarchar",
+                    "SQLColumnParams": "(max)",
+                    "dataFieldValueDef": tab_default,
+                    "isActive": 1,
+                    "notUseForGetData": 1,
+                }
+                resp = _jsonsave(cur, "csNGAppWindowDataSetsWhereFieldsJSONSave", [wrec])
+                if resp:
+                    return f"tabIdent whereField WARNING:\n{resp}"
+                log.append(f"  TAB where-field {tab_field} = {tab_default} ({'U' if exw else 'I'})")
+
+    return f"OK: linked window.\n  " + "\n  ".join(log)
+
+
+# ---------------------------------------------------------------------------
+# 22. ng_add_filter — where-field (+ optional lookup + watermark) in one call
+# ---------------------------------------------------------------------------
+
+def ng_add_filter(connection_string: str, app_window_ident: str, field_ident: str,
+                  format_type: str, sql_base_type: str, data_set_ident: str = "main",
+                  sql_column_params: Optional[str] = None, value_def: Optional[str] = None,
+                  not_use_for_get_data: Optional[bool] = None, ord: Optional[int] = None,
+                  label_pl: Optional[str] = None, label_en: Optional[str] = None,
+                  watermark: Optional[dict] = None, lookup_window_ident: Optional[str] = None,
+                  lookup_sets: Optional[Sequence[dict]] = None,
+                  lookup_gets: Optional[Sequence[dict]] = None,
+                  namespace_g: str = DEFAULT_NAMESPACE_G) -> str:
+    """Create a filter-panel where-field (+ optional lookup wiring + watermark) in one call.
+    - host string fields (lookups) default notUseForGetData=1 (they only drive searchText/set);
+    - watermark: {'PL':..,'EN':..,..} — needed for :showLabel=false fields (empty-field hint);
+    - lookup_window_ident + lookup_sets wires ng_add_lookup with source_kind='where'."""
+    log: List[str] = []
+    is_lookup_host = lookup_window_ident is not None
+    if not_use_for_get_data is None:
+        not_use_for_get_data = is_lookup_host and format_type == "string"
+
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            ex = _exec_scalar(
+                cur,
+                "select csNGAppWindowDataSetsWhereFieldsG from dbo.csNGAppWindowDataSetsWhereFields with(nolock) "
+                "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and dataFieldIdent=?",
+                namespace_g, app_window_ident, data_set_ident, field_ident,
+            )
+            if ord is None:
+                ord = int(_exec_scalar(
+                    cur,
+                    "select isnull(max(ord),0)+1 from dbo.csNGAppWindowDataSetsWhereFields with(nolock) "
+                    "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=?",
+                    namespace_g, app_window_ident, data_set_ident,
+                ) or 1)
+            rec = {
+                "_opr": "U" if ex else "I",
+                "csNGAppWindowDataSetsWhereFieldsG": str(ex).upper() if ex else _new_guid(),
+                "csAppNameSpacesG": namespace_g,
+                "appWindowIdent": app_window_ident,
+                "dataSetIdent": data_set_ident,
+                "dataFieldIdent": field_ident,
+                "formatType": format_type,
+                "SQLBaseType": sql_base_type,
+                "isActive": 1,
+                "ord": int(ord),
+            }
+            if sql_column_params:
+                rec["SQLColumnParams"] = sql_column_params
+            if value_def is not None:
+                rec["dataFieldValueDef"] = value_def
+            if not_use_for_get_data:
+                rec["notUseForGetData"] = 1
+            if label_pl:
+                rec["dataFieldLabDesc_PL"] = label_pl
+            if label_en:
+                rec["dataFieldLabDesc_EN"] = label_en
+            resp = _jsonsave(cur, "csNGAppWindowDataSetsWhereFieldsJSONSave", [rec])
+            if resp:
+                return f"whereField JSONSave WARNING:\n{resp}"
+            log.append(f"WHERE-FIELD {field_ident} ({format_type}/{sql_base_type}, {'U' if ex else 'I'})")
+
+            if watermark:
+                bad = [l for l in watermark if l not in NG_LABEL_LANGS]
+                if bad:
+                    return f"Error: watermark has unsupported lang(s): {', '.join(bad)}."
+                wrec = {
+                    "_opr": "U",
+                    "csNGAppWindowDataSetsWhereFieldsId": None,
+                    "csNGAppWindowDataSetsWhereFieldsG": None,
+                    "formatType": format_type,
+                }
+                cur.execute(
+                    "select csNGAppWindowDataSetsWhereFieldsId, csNGAppWindowDataSetsWhereFieldsG "
+                    "from dbo.csNGAppWindowDataSetsWhereFields with(nolock) "
+                    "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and dataFieldIdent=?",
+                    namespace_g, app_window_ident, data_set_ident, field_ident,
+                )
+                wr = cur.fetchone()
+                wrec["csNGAppWindowDataSetsWhereFieldsId"] = int(wr[0])
+                wrec["csNGAppWindowDataSetsWhereFieldsG"] = str(wr[1]).upper()
+                for lang, val in watermark.items():
+                    wrec[f"dataFieldWatermarkDesc_{lang}"] = val
+                resp = _jsonsave(cur, "csNGAppWindowDataSetsWhereFieldsJSONSave", [wrec])
+                if resp:
+                    return f"watermark JSONSave WARNING:\n{resp}"
+                log.append(f"  watermark ({', '.join(sorted(watermark))})")
+
+    if is_lookup_host:
+        lk = ng_add_lookup(
+            connection_string,
+            app_window_ident=app_window_ident,
+            field_ident=field_ident,
+            lookup_window_ident=lookup_window_ident,
+            data_set_ident=data_set_ident,
+            source_kind="where",
+            gets=lookup_gets,
+            sets=lookup_sets,
+            namespace_g=namespace_g,
+        )
+        log.append("  " + lk.replace("\n", "\n  "))
+
+    return "OK: ng_add_filter.\n  " + "\n  ".join(log)
+
+
+# ---------------------------------------------------------------------------
 # MCP tool descriptors + dispatcher
 # ---------------------------------------------------------------------------
 
@@ -1768,6 +2357,13 @@ CS_TOOL_NAMES = {
     "rebuild_user_rights",
     "ai_tool_sync_params",
     "ng_add_lookup",
+    "describe",
+    "sql_grep",
+    "ng_preview_dataset",
+    "ng_bulk_layout",
+    "ng_register_translates",
+    "ng_add_linked_window",
+    "ng_add_filter",
 }
 
 
@@ -1775,6 +2371,166 @@ def tool_descriptors():
     from mcp.types import Tool
 
     return [
+        Tool(
+            name="describe",
+            description=(
+                "Compact schema of a DB object: for a table/view -> columns "
+                "(name | type(len) NULL/NOT NULL [PK][identity][-> ref]); for a "
+                "procedure/function -> parameter list. Use INSTEAD of guessing "
+                "column names (avoids repeated 'Invalid column name')."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "object_name": {"type": "string", "description": "Object name (dbo. prefix optional), e.g. 'csNGAppWindowDataSetsActionsFields'."},
+                },
+                "required": ["object_name"],
+            },
+        ),
+        Tool(
+            name="sql_grep",
+            description=(
+                "Case-insensitive substring search over SQL object bodies "
+                "(sys.sql_modules). Returns object:line:content hits, like Grep over "
+                "files. Optional name_like narrows candidate objects. Use to locate "
+                "where a column/string is built instead of ad-hoc LIKE + substring."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Literal substring to find (case-insensitive)."},
+                    "name_like": {"type": "string", "description": "Optional: only objects whose name contains this."},
+                    "top": {"type": "integer", "description": "Max hits (default 100)."},
+                },
+                "required": ["pattern"],
+            },
+        ),
+        Tool(
+            name="ng_preview_dataset",
+            description=(
+                "Dry-run an NG dataset the way the runtime does: expand /*FIELDS*/ + "
+                "stmSQL template into the real data SELECT and EXECUTE it (top N, for "
+                "json). Catches reserved-word / invalid-column / missing-@var errors "
+                "that csNGValidateWindowForAI (config-only) misses. Returns generated "
+                "SQL + first rows, or the SQL + exact runtime error."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string"},
+                    "data_set_ident": {"type": "string", "description": "Default 'main'."},
+                    "where": {"type": "string", "description": "Optional @where JSON (default null)."},
+                    "top": {"type": "integer", "description": "Row cap 1..50 (default 5)."},
+                    "cs_companies_id": {"type": "integer", "description": "Company context (default: min company)."},
+                    "cs_usr_id": {"type": "integer", "description": "User context (default: min user)."},
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident"],
+            },
+        ),
+        Tool(
+            name="ng_bulk_layout",
+            description=(
+                "Bulk upsert grid layout columns in one call. columns: "
+                "[{field, visible?, ord?, width?, group?}]. Same pitfalls as "
+                "ng_set_layout_col (minimal-U, int isVisible, non-null width on INSERT, "
+                "group existence check). Ideal for hiding technical cols + reordering a "
+                "whole grid after csCreateNGWindowFromTableForAI."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string"},
+                    "columns": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "[{field, visible?, ord?, width?, group?}] — group='' detaches.",
+                    },
+                    "data_set_ident": {"type": "string", "description": "Default 'main'."},
+                    "layout_ident": {"type": "string", "description": "Default 'default'."},
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident", "columns"],
+            },
+        ),
+        Tool(
+            name="ng_register_translates",
+            description=(
+                "Register gT() idents on a window (csNGAppWindowTranslates). Each item: "
+                "{ident, cs_translate_g?} to reuse, OR {ident, PL, EN, ...} to "
+                "reuse-by-content (match Content_PL+Content_EN) or create a new "
+                "csTranslate. Idempotent on (appWindowIdent, translateIdent)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string"},
+                    "translates": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "[{ident, cs_translate_g?} | {ident, PL, EN, DE, ...}]",
+                    },
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident", "translates"],
+            },
+        ),
+        Tool(
+            name="ng_add_linked_window",
+            description=(
+                "Link a detail window to a master (csNGAppWindowsLinks + LinksFields) in "
+                "one call. map_fields: [{from, to?}] (master main field -> detail where-field). "
+                "placement: bottom-panel|outer-side-panel|side-panel|inner-side-panel. "
+                "Optional tab_default sets master where-field 'tabIdent-<placement>' (multi-tab "
+                "placements). labels {PL,EN,..} = tab caption. linkedWindows cache rebuilds "
+                "automatically."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident_from": {"type": "string"},
+                    "app_window_ident_to": {"type": "string"},
+                    "placement": {"type": "string"},
+                    "map_fields": {"type": "array", "items": {"type": "object"}, "description": "[{from, to?}]"},
+                    "ord": {"type": "integer", "description": "Tab order (default 1)."},
+                    "labels": {"type": "object", "description": "{PL,EN,DE,..} tab caption."},
+                    "tab_default": {"type": "string", "description": "appWindowIdentTo of the default tab (for multi-tab placement)."},
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident_from", "app_window_ident_to", "placement", "map_fields"],
+            },
+        ),
+        Tool(
+            name="ng_add_filter",
+            description=(
+                "Create a filter-panel where-field (+ optional lookup wiring + watermark) "
+                "in one call. Lookup hosts (string) default notUseForGetData=1. Provide "
+                "watermark {PL,EN,..} for :showLabel=false fields. lookup_window_ident + "
+                "lookup_sets wire ng_add_lookup with source_kind='where'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string"},
+                    "field_ident": {"type": "string"},
+                    "format_type": {"type": "string", "description": "string|integer|boolean|date|..."},
+                    "sql_base_type": {"type": "string", "description": "nvarchar|bigint|int|bit|date|..."},
+                    "data_set_ident": {"type": "string", "description": "Default 'main'."},
+                    "sql_column_params": {"type": "string", "description": "e.g. '(max)'."},
+                    "value_def": {"type": "string", "description": "dataFieldValueDef (radiogroup/checkbox default)."},
+                    "not_use_for_get_data": {"type": "boolean", "description": "Default: true for string lookup hosts."},
+                    "ord": {"type": "integer"},
+                    "label_pl": {"type": "string"},
+                    "label_en": {"type": "string"},
+                    "watermark": {"type": "object", "description": "{PL,EN,..} placeholder for :showLabel=false."},
+                    "lookup_window_ident": {"type": "string", "description": "Optional: wire a filter lookup."},
+                    "lookup_sets": {"type": "array", "items": {"type": "object"}, "description": "[{from_field, to_field?, source_kind_to?}]"},
+                    "lookup_gets": {"type": "array", "items": {"type": "object"}, "description": "[{value|from_field, to_field}]"},
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident", "field_ident", "format_type", "sql_base_type"],
+            },
+        ),
         Tool(
             name="deploy_sql_object",
             description=(
@@ -2273,6 +3029,86 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             search_get=bool(arguments.get("search_get", True)),
             gets=arguments.get("gets"),
             sets=arguments.get("sets"),
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "describe":
+        return describe(
+            connection_string,
+            object_name=arguments.get("object_name", ""),
+        )
+
+    if name == "sql_grep":
+        return sql_grep(
+            connection_string,
+            pattern=arguments.get("pattern", ""),
+            name_like=arguments.get("name_like"),
+            top=int(arguments.get("top") or 100),
+        )
+
+    if name == "ng_preview_dataset":
+        cid = arguments.get("cs_companies_id")
+        uid = arguments.get("cs_usr_id")
+        return ng_preview_dataset(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            data_set_ident=arguments.get("data_set_ident") or "main",
+            where=arguments.get("where"),
+            top=int(arguments.get("top") or 5),
+            cs_companies_id=int(cid) if cid is not None else None,
+            cs_usr_id=int(uid) if uid is not None else None,
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "ng_bulk_layout":
+        return ng_bulk_layout(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            columns=arguments.get("columns") or [],
+            data_set_ident=arguments.get("data_set_ident") or "main",
+            layout_ident=arguments.get("layout_ident") or "default",
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "ng_register_translates":
+        return ng_register_translates(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            translates=arguments.get("translates") or [],
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "ng_add_linked_window":
+        return ng_add_linked_window(
+            connection_string,
+            app_window_ident_from=arguments.get("app_window_ident_from", ""),
+            app_window_ident_to=arguments.get("app_window_ident_to", ""),
+            placement=arguments.get("placement", ""),
+            map_fields=arguments.get("map_fields") or [],
+            ord=int(arguments.get("ord") or 1),
+            labels=arguments.get("labels"),
+            tab_default=arguments.get("tab_default"),
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "ng_add_filter":
+        return ng_add_filter(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            field_ident=arguments.get("field_ident", ""),
+            format_type=arguments.get("format_type", ""),
+            sql_base_type=arguments.get("sql_base_type", ""),
+            data_set_ident=arguments.get("data_set_ident") or "main",
+            sql_column_params=arguments.get("sql_column_params"),
+            value_def=arguments.get("value_def"),
+            not_use_for_get_data=arguments.get("not_use_for_get_data"),
+            ord=arguments.get("ord"),
+            label_pl=arguments.get("label_pl"),
+            label_en=arguments.get("label_en"),
+            watermark=arguments.get("watermark"),
+            lookup_window_ident=arguments.get("lookup_window_ident"),
+            lookup_sets=arguments.get("lookup_sets"),
+            lookup_gets=arguments.get("lookup_gets"),
             namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
         )
 
