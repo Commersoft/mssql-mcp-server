@@ -247,9 +247,146 @@ class DatabaseConfig:
         return config, connection_string
 
 
+# ---------------------------------------------------------------------------
+# Server profiles — named environments reachable from execute_sql(server=...).
+# DEV is the .env default. Non-DEV profiles are READ-ONLY unless allow_write=true
+# (TESTGRODNO is always read-only). Passwords come from env (.env), never inline.
+# ---------------------------------------------------------------------------
+
+SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
+    # name: {server, database, user_env/user, password_env, hard_readonly}
+    "PROD": {
+        "server": "cs-sql03",
+        "database": "cs04",
+        "user": "adminjmk",
+        "password_env": "CSPROD_PWD",
+        "hard_readonly": False,
+        "hint": "PROD Grodno (cs-sql03/cs04). Zmiany danych tylko przez pakiety csSysChanges!",
+    },
+    "PLAY": {
+        "server": None,  # None = ten sam serwer co DEV
+        "database": "csPlay",
+        "user": None,    # None = creds DEV
+        "password_env": None,
+        "hard_readonly": False,
+        "hint": "Baza csPlay (projekt csNuxtPlay) na serwerze DEV.",
+    },
+    "LOT": {
+        "server": None,
+        "database": "csLot",
+        "user": None,
+        "password_env": None,
+        "hard_readonly": False,
+        "hint": "Baza csLot (projekt csNuxtLot) na serwerze DEV.",
+    },
+    "CSSQL01": {
+        "server": r"cs-sql01\cs",
+        "database": "cs",
+        "user": "adminjmk",
+        "password_env": "CSSQL01_PWD",
+        "hard_readonly": False,
+        "hint": "cs-sql01\\cs (czas pracy). CustomerDesc/ProjectDesc, nie Desc_PL.",
+    },
+    "SAVPOL": {
+        "server": r"CS-SQL02\SAVPOL",
+        "database": "cs06",
+        "user": "adminjmk",
+        "password_env": "CSSAVPOL_PWD",
+        "hard_readonly": False,
+        "hint": "Środowisko klienta Savpol. Hasło podaje user per-sesja (env CSSAVPOL_PWD).",
+    },
+    "TESTGRODNO": {
+        "server": r"CS-BCKP01\GRODNO",
+        "database": "test04",
+        "user_env": "CSTESTGRODNO_USER",
+        "password_env": "CSTESTGRODNO_PWD",
+        "hard_readonly": True,
+        "hint": "Baza testowa — ZAWSZE read-only.",
+    },
+}
+
+_WRITE_TOKEN_RE = re.compile(
+    r"\b(insert|update|delete|merge|truncate|alter|create|drop|grant|revoke|exec|execute)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_sql_literals_and_comments(sql: str) -> str:
+    """Remove '...' literals, -- comments and /* */ blocks so the write-guard
+    does not trip on keywords inside strings/comments."""
+    out: List[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "'":
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        i += 2
+                        continue
+                    break
+                i += 1
+            i += 1
+            out.append(" ")
+        elif ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            while i < n and sql[i] != "\n":
+                i += 1
+        elif ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (sql[i] == "*" and sql[i + 1] == "/"):
+                i += 1
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def find_write_token(sql: str) -> Optional[str]:
+    """Return the first write-capable keyword outside strings/comments, or None."""
+    m = _WRITE_TOKEN_RE.search(_strip_sql_literals_and_comments(sql))
+    return m.group(1).lower() if m else None
+
+
+def resolve_profile_connection(profile_name: str) -> Tuple[str, str]:
+    """Build (connection_string, label) for a named server profile.
+    Raises ValueError with an actionable message when creds are missing."""
+    prof = SERVER_PROFILES.get(profile_name)
+    if prof is None:
+        raise ValueError(
+            f"Unknown server profile '{profile_name}'. "
+            f"Available: DEV, {', '.join(sorted(SERVER_PROFILES))}."
+        )
+    dev_config, _ = DatabaseConfig.get_config()
+    server = prof["server"] or dev_config["server"]
+    database = prof["database"]
+    if prof.get("user_env"):
+        user = os.getenv(prof["user_env"])
+        if not user:
+            raise ValueError(f"Profile {profile_name}: set env {prof['user_env']} (user).")
+    else:
+        user = prof["user"] or os.getenv("MSSQL_USER")
+    if prof.get("password_env"):
+        password = os.getenv(prof["password_env"])
+        if not password:
+            raise ValueError(
+                f"Profile {profile_name}: missing env {prof['password_env']} (password). "
+                f"Poproś użytkownika o hasło / ustaw w mssql-mcp-server/.env."
+            )
+    else:
+        password = os.getenv("MSSQL_PASSWORD")
+    driver = os.getenv("MSSQL_DRIVER", "ODBC Driver 17 for SQL Server")
+    conn = (
+        f"Driver={{{driver}}};Server={server};Database={database};"
+        f"UID={user};PWD={password};TrustServerCertificate=yes;Encrypt=no;"
+    )
+    return conn, f"{server}/{database}"
+
+
 class SQLExecutor:
     """Handles SQL query execution"""
-    
+
     def __init__(self, connection_string: str):
         self.connection_string = connection_string
         self.preprocessor = QueryPreprocessor()
@@ -293,6 +430,13 @@ class SQLExecutor:
             aggregated: List[str] = []
             with connect(self.connection_string) as conn:
                 conn.autocommit = True  # nie otwieraj niejawnej transakcji
+                # PROD (cs-sql03) zwraca krzaki bez jawnego dekodowania; na DEV neutralne.
+                try:
+                    import pyodbc as _pyodbc
+                    conn.setdecoding(_pyodbc.SQL_CHAR, encoding="cp1250")
+                    conn.setdecoding(_pyodbc.SQL_WCHAR, encoding="utf-16-le")
+                except Exception:
+                    pass
                 with conn.cursor() as cursor:
                     for idx, (batch_sql, repeat) in enumerate(batches, start=1):
                         for _ in range(repeat):
@@ -628,13 +772,28 @@ async def list_tools() -> List[Tool]:
     return [
         Tool(
             name="execute_sql",
-            description="Execute an SQL query on the MSSQL server",
+            description=(
+                "Execute an SQL query. Default target = DEV (from .env). Optional `server` targets a named "
+                "profile: PROD (cs-sql03/cs04 — Grodno), PLAY (csPlay), LOT (csLot), CSSQL01 (cs-sql01\\cs — czas pracy), "
+                "SAVPOL (CS-SQL02\\SAVPOL/cs06), TESTGRODNO (CS-BCKP01\\GRODNO/test04, ALWAYS read-only). "
+                "Non-DEV profiles are READ-ONLY by default: insert/update/delete/exec/DDL are rejected unless "
+                "allow_write=true. Schema changes on PROD are forbidden regardless (use csSysChanges packages)."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
                         "description": "The SQL query to execute"
+                    },
+                    "server": {
+                        "type": "string",
+                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO"],
+                        "description": "Target environment (default DEV)."
+                    },
+                    "allow_write": {
+                        "type": "boolean",
+                        "description": "Required to run write statements (DML/exec/DDL) on a non-DEV profile. Ignored on TESTGRODNO (hard read-only)."
                     }
                 },
                 "required": ["query"]
@@ -683,22 +842,48 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
     query = arguments.get("query")
     if not query:
         raise ValueError("Query parameter is required")
-    
+
+    profile_name = (arguments.get("server") or "DEV").upper()
+    allow_write = bool(arguments.get("allow_write"))
+
     # Log query info (truncated for security)
     query_preview = query[:100] + "..." if len(query) > 100 else query
-    logger.info(f"Executing query: {query_preview}")
-    
+    logger.info(f"Executing query on {profile_name}: {query_preview}")
+
     try:
-        config, connection_string = DatabaseConfig.get_config()
-        executor = SQLExecutor(connection_string)
-        
-        success, results, error = executor.execute_query(query)
-        
-        if success:
-            return [TextContent(type="text", text="\n".join(results))]
+        if profile_name == "DEV":
+            config, connection_string = DatabaseConfig.get_config()
+            label = f"{config['server']}/{config['database']}"
         else:
-            return [TextContent(type="text", text=f"Error: {error}")]
-            
+            prof = SERVER_PROFILES.get(profile_name)
+            if prof is None:
+                return [TextContent(type="text", text=(
+                    f"Error: unknown server profile '{profile_name}'. "
+                    f"Available: DEV, {', '.join(sorted(SERVER_PROFILES))}."
+                ))]
+            token = find_write_token(query)
+            if token and prof["hard_readonly"]:
+                return [TextContent(type="text", text=(
+                    f"Error: profile {profile_name} is ALWAYS read-only (statement contains '{token}'). "
+                    f"{prof.get('hint', '')}"
+                ))]
+            if token and not allow_write:
+                return [TextContent(type="text", text=(
+                    f"Error: profile {profile_name} is read-only by default and the statement contains "
+                    f"'{token}'. Pass allow_write=true ONLY if the write is intended and allowed on this "
+                    f"environment. {prof.get('hint', '')}"
+                ))]
+            connection_string, label = resolve_profile_connection(profile_name)
+
+        executor = SQLExecutor(connection_string)
+        success, results, error = executor.execute_query(query)
+
+        header = [] if profile_name == "DEV" else [f"-- server: {profile_name} ({label}) --"]
+        if success:
+            return [TextContent(type="text", text="\n".join(header + results))]
+        else:
+            return [TextContent(type="text", text="\n".join(header + [f"Error: {error}"]))]
+
     except Exception as e:
         logger.error(f"Error in call_tool: {str(e)}", exc_info=True)
         return [TextContent(type="text", text=f"Error: {str(e)}")]

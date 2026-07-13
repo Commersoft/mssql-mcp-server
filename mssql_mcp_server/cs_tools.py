@@ -2341,6 +2341,1206 @@ def ng_add_filter(connection_string: str, app_window_ident: str, field_ident: st
 # MCP tool descriptors + dispatcher
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 23. Shared helper — ensure a csTranslate row for given texts (reuse/create)
+# ---------------------------------------------------------------------------
+
+def _ensure_translate(cur, texts: dict) -> tuple:
+    """Return (csTranslateG, action). Reuse by Content_PL+Content_EN or create."""
+    pl = texts.get("PL")
+    en = texts.get("EN")
+    if not pl:
+        raise ValueError("PL text is required to create/reuse a csTranslate row.")
+    tg = _exec_scalar(
+        cur,
+        "select top 1 csTranslateG from dbo.csTranslate with(nolock) "
+        "where Content_PL = ? and isnull(Content_EN,N'') = isnull(?,N'')",
+        pl, en,
+    )
+    if tg:
+        return str(tg).upper(), "reused"
+    tg = _new_guid()
+    row = {"_opr": "I", "csTranslateG": tg}
+    for lang, val in texts.items():
+        if lang in NG_COLSGROUP_LANGS and val:
+            row[f"Content_{lang}"] = val
+    resp = _jsonsave(cur, "csTranslateJSONSave", [row])
+    if resp:
+        raise RuntimeError(f"csTranslateJSONSave: {resp}")
+    return tg, "created"
+
+
+# ---------------------------------------------------------------------------
+# 24. ng_add_action — dataset action + fields + privileges + optional rebuild
+# ---------------------------------------------------------------------------
+
+def ng_add_action(
+    connection_string: str,
+    app_window_ident: str,
+    action_ident: str,
+    data_set_ident: str = "main",
+    labels: Optional[dict] = None,
+    sql_name: Optional[str] = None,
+    kind: Optional[str] = None,
+    crud: Optional[str] = None,
+    show_view: Optional[bool] = None,
+    view_html: Optional[str] = None,
+    ord: Optional[int] = None,
+    hide_when_empty: Optional[bool] = None,
+    show_confirmation: Optional[bool] = None,
+    add_current_row: Optional[bool] = None,
+    add_where: Optional[bool] = None,
+    ref_kind: Optional[int] = None,
+    close_after_exec: Optional[bool] = None,
+    is_auto: Optional[bool] = None,
+    fields: Optional[Sequence[dict]] = None,
+    extra: Optional[dict] = None,
+    wire_privileges: bool = True,
+    rebuild: bool = False,
+    cs_companies_id: Optional[int] = None,
+    namespace_g: str = DEFAULT_NAMESPACE_G,
+) -> str:
+    """
+    Register/update an NG dataset action (csNGAppWindowDataSetsActions) with the
+    framework conventions handled:
+      - crud='ins'|'upd'|'del' presets the standard auto-action flags
+        (ins: isRowsInsert=1/ord=1; upd: isRowsUpdate=1/hideWhenEmpty=1;
+         del: isRowsDelete=1/hideWhenEmpty=1/showConfirmation=1); refKind=1, isAuto=1.
+      - custom action (no crud): isAuto=0, ord=max+1, position='default' (NOT NULL).
+      - labels {PL,EN,...} -> actionDesc_* (10 languages).
+      - fields: [{dataFieldIdent, dataFieldValueDef?, dataFieldIdentForNewRowValue?}]
+        -> csNGAppWindowDataSetsActionsFields.
+      - wire_privileges: for every granular window privilege (hasRightsAllDataSets=0
+        with a dataset row hasRightsAllActions=0) inserts the ActionsPrivileges row —
+        WITHOUT this the new action stays invisible for those users.
+      - view_html: stores the action form template (showView=1 implied).
+    After adding an action REMEMBER: rights cache rebuild (rebuild=True +
+    cs_companies_id, or rebuild_user_rights tool) or the button will not appear.
+    """
+    aw = (app_window_ident or "").strip()
+    act = (action_ident or "").strip()
+    if not aw or not act:
+        return "Error: app_window_ident and action_ident are required."
+    if not re.match(r"^[A-Za-z][A-Za-z0-9]*$", act):
+        return (f"Error: actionIdent '{act}' — framework allows only letters+digits "
+                "(no underscore: 'Pole [Symbol] nie może zawierać znaku _').")
+    if crud and crud not in ("ins", "upd", "del"):
+        return "Error: crud must be one of ins|upd|del (or omitted for a custom action)."
+
+    out: List[str] = []
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            ds = _exec_scalar(
+                cur,
+                "select count(*) from dbo.csNGAppWindowDataSets with(nolock) "
+                "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=?",
+                namespace_g, aw, data_set_ident,
+            )
+            if not ds:
+                return f"Error: dataset {aw}.{data_set_ident} not found (namespace {namespace_g})."
+
+            cur.execute(
+                "select csNGAppWindowDataSetsActionsId, csNGAppWindowDataSetsActionsG "
+                "from dbo.csNGAppWindowDataSetsActions with(nolock) "
+                "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and actionIdent=?",
+                namespace_g, aw, data_set_ident, act,
+            )
+            existing = cur.fetchone()
+
+            row: dict = {
+                "csAppNameSpacesG": namespace_g,
+                "appWindowIdent": aw,
+                "dataSetIdent": data_set_ident,
+                "actionIdent": act,
+            }
+            if existing:
+                row["_opr"] = "U"
+                row["csNGAppWindowDataSetsActionsId"] = int(existing[0])
+                row["csNGAppWindowDataSetsActionsG"] = str(existing[1]).upper()
+            else:
+                row["_opr"] = "I"
+                row["csNGAppWindowDataSetsActionsG"] = _new_guid()
+                # CRUD presets (pattern: csStatuses ins/upd/del)
+                presets = {
+                    "ins": {"ord": 1, "isAuto": 1, "isRowsInsert": 1, "hideWhenEmpty": 0, "refKind": 1},
+                    "upd": {"ord": 2, "isAuto": 1, "isRowsUpdate": 1, "hideWhenEmpty": 1, "refKind": 1},
+                    "del": {"ord": 3, "isAuto": 1, "isRowsDelete": 1, "hideWhenEmpty": 1,
+                            "refKind": 1, "showConfirmation": 1},
+                }
+                if crud:
+                    row.update(presets[crud])
+                else:
+                    max_ord = _exec_scalar(
+                        cur,
+                        "select isnull(max(ord),0) from dbo.csNGAppWindowDataSetsActions with(nolock) "
+                        "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=?",
+                        namespace_g, aw, data_set_ident,
+                    )
+                    row.setdefault("ord", int(max_ord) + 1)
+                    row.setdefault("isAuto", 0)
+                    row.setdefault("hideWhenEmpty", 1)
+                    row.setdefault("refKind", 1)
+                row.setdefault("position", "default")  # NOT NULL
+
+            # explicit overrides
+            overrides = {
+                "ord": ord, "kind": kind, "SQLName": sql_name,
+                "hideWhenEmpty": hide_when_empty, "showConfirmation": show_confirmation,
+                "addCurrentRow": add_current_row, "addWhere": add_where,
+                "refKind": ref_kind, "closeAfterExec": close_after_exec,
+                "isAuto": is_auto, "showView": show_view,
+            }
+            for col, val in overrides.items():
+                if val is not None:
+                    row[col] = _as_int(val) if isinstance(val, bool) else val
+            if view_html is not None:
+                row["viewHTML"] = view_html
+                row.setdefault("showView", 1)
+            for lang, val in (labels or {}).items():
+                if lang in NG_LABEL_LANGS and val:
+                    row[f"actionDesc_{lang}"] = val
+            for col, val in (extra or {}).items():
+                row[col] = _as_int(val) if isinstance(val, bool) else val
+
+            resp = _jsonsave(cur, "csNGAppWindowDataSetsActionsJSONSave", [row])
+            if resp:
+                return f"csNGAppWindowDataSetsActionsJSONSave ERROR:\n{resp}"
+            out.append(f"ACTION {aw}.{data_set_ident}.{act}: {'updated' if existing else 'inserted'}"
+                       + (f" (crud preset '{crud}')" if crud and not existing else ""))
+
+            # --- action fields ---
+            for f in (fields or []):
+                fi = (f.get("dataFieldIdent") or "").strip()
+                if not fi:
+                    return f"Error: fields item without dataFieldIdent: {f}"
+                fg = _exec_scalar(
+                    cur,
+                    "select csNGAppWindowDataSetsActionsFieldsG from dbo.csNGAppWindowDataSetsActionsFields with(nolock) "
+                    "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and actionIdent=? and dataFieldIdent=?",
+                    namespace_g, aw, data_set_ident, act, fi,
+                )
+                frow = {
+                    "_opr": "U" if fg else "I",
+                    "csNGAppWindowDataSetsActionsFieldsG": str(fg).upper() if fg else _new_guid(),
+                    "csAppNameSpacesG": namespace_g,
+                    "appWindowIdent": aw,
+                    "dataSetIdent": data_set_ident,
+                    "actionIdent": act,
+                    "dataFieldIdent": fi,
+                }
+                if fg:
+                    fid = _exec_scalar(
+                        cur,
+                        "select csNGAppWindowDataSetsActionsFieldsId from dbo.csNGAppWindowDataSetsActionsFields with(nolock) "
+                        "where csNGAppWindowDataSetsActionsFieldsG=?", fg,
+                    )
+                    frow["csNGAppWindowDataSetsActionsFieldsId"] = int(fid)
+                for k in ("dataFieldValueDef", "dataFieldIdentForNewRowValue"):
+                    if f.get(k) is not None:
+                        frow[k] = f[k]
+                resp = _jsonsave(cur, "csNGAppWindowDataSetsActionsFieldsJSONSave", [frow])
+                if resp:
+                    return f"ActionsFieldsJSONSave ERROR ({fi}):\n{resp}"
+                out.append(f"  field {fi}: {'U' if fg else 'I'}")
+
+            # --- privileges wiring (granular privileges only) ---
+            if wire_privileges:
+                cur.execute(
+                    "select p.csPrivilegesG, p.hasRightsAllDataSets from dbo.csNGAppWindowsPrivileges p with(nolock) "
+                    "where p.csAppNameSpacesG=? and p.appWindowIdent=?",
+                    namespace_g, aw,
+                )
+                privs = cur.fetchall()
+                wired = 0
+                for pg, all_ds in privs:
+                    if all_ds:
+                        continue
+                    dsp = cur.execute(
+                        "select hasRightsAllActions from dbo.csNGAppWindowsDataSetsPrivileges with(nolock) "
+                        "where csPrivilegesG=? and csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=?",
+                        pg, namespace_g, aw, data_set_ident,
+                    ).fetchone()
+                    if not dsp or dsp[0]:
+                        continue
+                    exists_ap = _exec_scalar(
+                        cur,
+                        "select count(*) from dbo.csNGAppWindowsDataSetsActionsPrivileges with(nolock) "
+                        "where csPrivilegesG=? and csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and actionIdent=?",
+                        pg, namespace_g, aw, data_set_ident, act,
+                    )
+                    if exists_ap:
+                        continue
+                    resp = _jsonsave(cur, "csNGAppWindowsDataSetsActionsPrivilegesJSONSave", [{
+                        "_opr": "I",
+                        "csNGAppWindowsDataSetsActionsPrivilegesG": _new_guid(),
+                        "csPrivilegesG": str(pg).upper(),
+                        "csAppNameSpacesG": namespace_g,
+                        "appWindowIdent": aw,
+                        "dataSetIdent": data_set_ident,
+                        "actionIdent": act,
+                    }])
+                    if resp:
+                        return f"ActionsPrivilegesJSONSave ERROR:\n{resp}"
+                    wired += 1
+                out.append(f"  privileges: {wired} granular grant(s) added"
+                           + ("" if privs else " (window has NO privileges — run ng_ensure_privileges!)"))
+
+    if rebuild:
+        out.append(rebuild_user_rights(connection_string, cs_companies_id=cs_companies_id))
+    else:
+        out.append("REMINDER: rebuild_user_rights after action/menu/privilege changes (button invisible otherwise).")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 25. ng_ensure_privileges — audit/create/repair window privileges + grant
+# ---------------------------------------------------------------------------
+
+def ng_ensure_privileges(
+    connection_string: str,
+    app_window_ident: str,
+    create_if_missing: bool = True,
+    privilege_desc_pl: Optional[str] = None,
+    privilege_desc_en: Optional[str] = None,
+    privilege_group_pl: str = "DSM",
+    fix_gaps: bool = False,
+    grant_cs_usr_id: Optional[int] = None,
+    grant_cs_companies_id: Optional[int] = None,
+    grant_privilege_g: Optional[str] = None,
+    rebuild: bool = False,
+    namespace_g: str = DEFAULT_NAMESPACE_G,
+) -> str:
+    """
+    Audit and repair the privilege wiring of an NG window. Model: csPrivileges (GUID
+    identity, no text ident) -> csNGAppWindowsPrivileges (hasRightsAllDataSets=1 = full)
+    -> optional granular DataSets/Actions privilege rows. A window WITHOUT any
+    csNGAppWindowsPrivileges row = eternal spinner for non-admin users.
+      - create_if_missing: creates a full-rights privilege (desc default = window PL desc).
+      - fix_gaps: for granular privileges inserts missing DataSets rows
+        (hasRightsAllActions=1) / Actions rows so the privilege covers the whole window.
+      - grant_cs_usr_id + grant_cs_companies_id: grants via csCompaniesUsrsPrivileges
+        (grant_privilege_g required when the window has >1 privilege).
+      - rebuild: rebuild_user_rights afterwards (scoped to grant company/user if given).
+    """
+    aw = (app_window_ident or "").strip()
+    if not aw:
+        return "Error: app_window_ident is required."
+    out: List[str] = []
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            wdesc = _exec_scalar(
+                cur,
+                "select appWindowDesc_PL from dbo.csNGAppWindows with(nolock) "
+                "where csAppNameSpacesG=? and appWindowIdent=?",
+                namespace_g, aw,
+            )
+            if wdesc is None:
+                return f"Error: window '{aw}' not found (namespace {namespace_g})."
+
+            cur.execute(
+                "select wp.csPrivilegesG, wp.hasRightsAllDataSets, p.PrivilegeDesc_PL, p.PrivilegeGroupDesc_PL "
+                "from dbo.csNGAppWindowsPrivileges wp with(nolock) "
+                "join dbo.csPrivileges p with(nolock) on p.csPrivilegesG = wp.csPrivilegesG "
+                "where wp.csAppNameSpacesG=? and wp.appWindowIdent=?",
+                namespace_g, aw,
+            )
+            privs = cur.fetchall()
+
+            if not privs and create_if_missing:
+                pg = _new_guid()
+                resp = _jsonsave(cur, "csPrivilegesJSONSave", [{
+                    "_opr": "I", "csPrivilegesG": pg,
+                    "PrivilegeDesc_PL": privilege_desc_pl or wdesc or aw,
+                    "PrivilegeDesc_EN": privilege_desc_en,
+                    "PrivilegeGroupDesc_PL": privilege_group_pl,
+                }])
+                if resp:
+                    return f"csPrivilegesJSONSave ERROR:\n{resp}"
+                resp = _jsonsave(cur, "csNGAppWindowsPrivilegesJSONSave", [{
+                    "_opr": "I", "csNGAppWindowsPrivilegesG": _new_guid(),
+                    "csPrivilegesG": pg, "csAppNameSpacesG": namespace_g,
+                    "appWindowIdent": aw, "hasRightsAllDataSets": 1,
+                }])
+                if resp:
+                    return f"csNGAppWindowsPrivilegesJSONSave ERROR:\n{resp}"
+                out.append(f"CREATED full-rights privilege '{privilege_desc_pl or wdesc or aw}' ({pg}) "
+                           f"group '{privilege_group_pl}', hasRightsAllDataSets=1.")
+                privs = [(pg, 1, privilege_desc_pl or wdesc or aw, privilege_group_pl)]
+            elif not privs:
+                return (f"WINDOW {aw}: NO privileges (users see an eternal spinner). "
+                        f"Re-run with create_if_missing=True to fix.")
+
+            out.append(f"WINDOW {aw}: {len(privs)} privilege(s):")
+            cur.execute(
+                "select dataSetIdent from dbo.csNGAppWindowDataSets with(nolock) "
+                "where csAppNameSpacesG=? and appWindowIdent=?", namespace_g, aw)
+            all_ds = [r[0] for r in cur.fetchall()]
+
+            for pg, all_flag, dpl, grp in privs:
+                pg = str(pg).upper()
+                usr_cnt = _exec_scalar(
+                    cur, "select count(*) from dbo.csCompaniesUsrsPrivileges with(nolock) where csPrivilegesG=?", pg)
+                out.append(f"  {pg} | '{dpl}' (grupa '{grp}') | hasRightsAllDataSets={all_flag} "
+                           f"| nadany {usr_cnt} userom")
+                if all_flag:
+                    continue
+                # granular audit
+                cur.execute(
+                    "select dataSetIdent, hasRightsAllActions from dbo.csNGAppWindowsDataSetsPrivileges with(nolock) "
+                    "where csPrivilegesG=? and csAppNameSpacesG=? and appWindowIdent=?",
+                    pg, namespace_g, aw,
+                )
+                dsp = {r[0]: r[1] for r in cur.fetchall()}
+                missing_ds = [d for d in all_ds if d not in dsp]
+                if missing_ds:
+                    if fix_gaps:
+                        rows = [{
+                            "_opr": "I", "csNGAppWindowsDataSetsPrivilegesG": _new_guid(),
+                            "csPrivilegesG": pg, "csAppNameSpacesG": namespace_g,
+                            "appWindowIdent": aw, "dataSetIdent": d,
+                            "hasRightsAllActions": 1, "hasRightsAllLayoutsCols": 1,
+                            "hasRightsAllColsGroups": 1,
+                        } for d in missing_ds]
+                        resp = _jsonsave(cur, "csNGAppWindowsDataSetsPrivilegesJSONSave", rows)
+                        if resp:
+                            return f"DataSetsPrivilegesJSONSave ERROR:\n{resp}"
+                        out.append(f"    FIXED: added dataset grants: {', '.join(missing_ds)}")
+                    else:
+                        out.append(f"    GAP: datasets not covered: {', '.join(missing_ds)} (fix_gaps=True to add)")
+                for d, all_act in dsp.items():
+                    if all_act:
+                        continue
+                    cur.execute(
+                        "select a.actionIdent from dbo.csNGAppWindowDataSetsActions a with(nolock) "
+                        "where a.csAppNameSpacesG=? and a.appWindowIdent=? and a.dataSetIdent=? "
+                        "and not exists (select 1 from dbo.csNGAppWindowsDataSetsActionsPrivileges ap with(nolock) "
+                        " where ap.csPrivilegesG=? and ap.csAppNameSpacesG=a.csAppNameSpacesG "
+                        " and ap.appWindowIdent=a.appWindowIdent and ap.dataSetIdent=a.dataSetIdent "
+                        " and ap.actionIdent=a.actionIdent)",
+                        namespace_g, aw, d, pg,
+                    )
+                    missing_act = [r[0] for r in cur.fetchall()]
+                    if missing_act:
+                        if fix_gaps:
+                            rows = [{
+                                "_opr": "I", "csNGAppWindowsDataSetsActionsPrivilegesG": _new_guid(),
+                                "csPrivilegesG": pg, "csAppNameSpacesG": namespace_g,
+                                "appWindowIdent": aw, "dataSetIdent": d, "actionIdent": a,
+                            } for a in missing_act]
+                            resp = _jsonsave(cur, "csNGAppWindowsDataSetsActionsPrivilegesJSONSave", rows)
+                            if resp:
+                                return f"ActionsPrivilegesJSONSave ERROR:\n{resp}"
+                            out.append(f"    FIXED: {d}: added action grants: {', '.join(missing_act)}")
+                        else:
+                            out.append(f"    GAP: {d}: actions not covered: {', '.join(missing_act)}")
+
+            # --- grant to user ---
+            if grant_cs_usr_id:
+                if not grant_cs_companies_id:
+                    return "\n".join(out) + "\nError: grant requires grant_cs_companies_id."
+                pg = (grant_privilege_g or "").upper()
+                if not pg:
+                    if len(privs) == 1:
+                        pg = str(privs[0][0]).upper()
+                    else:
+                        return "\n".join(out) + "\nError: window has multiple privileges — pass grant_privilege_g."
+                already = _exec_scalar(
+                    cur,
+                    "select count(*) from dbo.csCompaniesUsrsPrivileges with(nolock) "
+                    "where csCompaniesId=? and csUsrId=? and csPrivilegesG=?",
+                    int(grant_cs_companies_id), int(grant_cs_usr_id), pg,
+                )
+                if already:
+                    out.append(f"GRANT: user {grant_cs_usr_id} already has {pg}.")
+                else:
+                    resp = _jsonsave(cur, "csCompaniesUsrsPrivilegesJSONSave", [{
+                        "_opr": "I", "csCompaniesUsrsPrivilegesG": _new_guid(),
+                        "csCompaniesId": int(grant_cs_companies_id),
+                        "csUsrId": int(grant_cs_usr_id), "csPrivilegesG": pg,
+                    }])
+                    if resp:
+                        return f"csCompaniesUsrsPrivilegesJSONSave ERROR:\n{resp}"
+                    out.append(f"GRANT: privilege {pg} -> user {grant_cs_usr_id} (company {grant_cs_companies_id}).")
+
+    if rebuild:
+        out.append(rebuild_user_rights(connection_string,
+                                       cs_companies_id=grant_cs_companies_id,
+                                       cs_usr_id=grant_cs_usr_id,
+                                       confirm_all=not grant_cs_companies_id))
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 26. ng_add_menu_entry — NGDict menu entry NEXT TO the Dict one (never replace)
+# ---------------------------------------------------------------------------
+
+def ng_add_menu_entry(
+    connection_string: str,
+    app_window_ident: str,
+    dict_app_window: Optional[str] = None,
+    parent_menu_path: Optional[str] = None,
+    labels: Optional[dict] = None,
+    menu_path: Optional[str] = None,
+    ord: Optional[int] = None,
+    usable: bool = True,
+    rebuild: bool = False,
+    cs_companies_id: Optional[int] = None,
+    namespace_g: str = DEFAULT_NAMESPACE_G,
+) -> str:
+    """
+    Add the NG menu entry (Kind='NGDict') for a window, enforcing the project rule:
+    the Dict entry is NEVER replaced — both entries coexist.
+      - If the Dict predecessor has a menu entry (dict_app_window, default =
+        app_window_ident): the NGDict entry is CLONED from it (same parent/Id/labels/
+        ContentGuid/Icon, generator formula for menuPath slug from appWindowDesc_PL).
+      - Otherwise a fresh entry is created under parent_menu_path (menuPath of the
+        parent node, e.g. '/rozrachunki'); labels {PL,...} required (ContentGuid is
+        reused/created in csTranslate by content).
+    Idempotent: existing NGDict entry -> reports it (and can flip usable).
+    REMEMBER: menu changes need the user cache rebuild (rebuild=True + cs_companies_id).
+    """
+    aw = (app_window_ident or "").strip()
+    if not aw:
+        return "Error: app_window_ident is required."
+    out: List[str] = []
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            wdesc = _exec_scalar(
+                cur,
+                "select appWindowDesc_PL from dbo.csNGAppWindows with(nolock) "
+                "where csAppNameSpacesG=? and appWindowIdent=?", namespace_g, aw)
+            if wdesc is None:
+                return f"Error: NG window '{aw}' not found (namespace {namespace_g})."
+
+            cur.execute(
+                "select csAppMainMenusItemsId, csAppMainMenusItemsG, menuPath, usable "
+                "from dbo.csAppMainMenusItems with(nolock) "
+                "where appWindowIdent=? and csAppNameSpacesG=? and Kind=N'NGDict'",
+                aw, namespace_g,
+            )
+            existing = cur.fetchall()
+            if existing:
+                for r in existing:
+                    out.append(f"EXISTS: NGDict entry Id={r[0]} menuPath={r[2]!r} usable={r[3]}")
+                    if usable and not r[3]:
+                        resp = _jsonsave(cur, "csAppMainMenusItemsJSONSave", [{
+                            "_opr": "U", "csAppMainMenusItemsId": int(r[0]),
+                            "csAppMainMenusItemsG": str(r[1]).upper(), "usable": 1,
+                        }])
+                        out.append("  usable -> 1" + (f" (WARN: {resp})" if resp else ""))
+                return "\n".join(out)
+
+            slug = _exec_scalar(
+                cur, "select replace(lower(dbo.csFnNonPLOnlyCharV01(?)), N' ', N'-')",
+                (labels or {}).get("PL") or wdesc or aw)
+
+            # Case A: clone from the Dict predecessor's entry
+            dict_name = (dict_app_window or aw).strip()
+            cur.execute(
+                "select top 1 p.csAppMainMenusParentItemsG, p.csAppMainMenusG, p.Id, p.Icon, p.IsQuick, "
+                "p.StripColorBrush, p.ContentGuid, p.notShowInAppMenu, p.commands, p.params, "
+                "isnull(nullif(pr.parentMenuPath, N'/'), N'') parentPath, "
+                "p.Content_PL, p.Content_EN, p.Content_DE, p.Content_FR, p.Content_ES, p.Content_IT, "
+                "p.Content_NL, p.Content_PT, p.Content_RU, p.Content_UK, p.Content_SK, p.Content_SE "
+                "from dbo.csAppMainMenusItems p with(nolock) "
+                "join dbo.csAppWindows a with(nolock) on a.csAppWindowsG = p.csAppWindowsG "
+                "outer apply (select max(parent.menuPath) parentMenuPath from dbo.csAppMainMenusItems parent with(nolock) "
+                "  where parent.csAppMainMenusItemsG = p.csAppMainMenusParentItemsG) pr "
+                "where a.AppWindow = ? and p.Kind = N'Dict' "
+                "order by p.usable desc, p.csAppMainMenusItemsId",
+                dict_name,
+            )
+            dict_row = cur.fetchone()
+
+            if dict_row:
+                cols = [d[0] for d in cur.description]
+                d = dict(zip(cols, dict_row))
+                new_path = menu_path or (d["parentPath"] + "/" + slug)
+                row = {
+                    "_opr": "I", "csAppMainMenusItemsG": _new_guid(),
+                    "csAppMainMenusParentItemsG": str(d["csAppMainMenusParentItemsG"]).upper()
+                        if d["csAppMainMenusParentItemsG"] else None,
+                    "csAppMainMenusG": str(d["csAppMainMenusG"]).upper(),
+                    "Id": int(ord if ord is not None else d["Id"]),
+                    "csAppWindowsG": None, "Kind": "NGDict",
+                    "Icon": d["Icon"], "IsQuick": _as_int(d["IsQuick"] or 0),
+                    "StripColorBrush": d["StripColorBrush"],
+                    "appWindowIdent": aw, "csAppNameSpacesG": namespace_g,
+                    "ContentGuid": str(d["ContentGuid"]).upper(),
+                    "childMenuPath": slug, "menuPath": new_path,
+                    "notShowInAppMenu": _as_int(d["notShowInAppMenu"] or 0),
+                    "commands": d["commands"], "params": d["params"],
+                    "deprecated": 0, "usable": _as_int(usable),
+                }
+                for lang in NG_COLSGROUP_LANGS:
+                    row[f"Content_{lang}"] = (labels or {}).get(lang) or d.get(f"Content_{lang}")
+                mode = f"cloned from Dict entry of '{dict_name}'"
+            else:
+                # Case B: fresh entry under parent_menu_path
+                if not parent_menu_path:
+                    return (f"Error: no Dict menu entry found for '{dict_name}' — pass parent_menu_path "
+                            f"(menuPath of the parent node) and labels for a fresh entry.")
+                cur.execute(
+                    "select csAppMainMenusItemsG, csAppMainMenusG, menuPath from dbo.csAppMainMenusItems with(nolock) "
+                    "where menuPath = ?", parent_menu_path)
+                parent = cur.fetchone()
+                if not parent:
+                    return f"Error: parent menu item with menuPath='{parent_menu_path}' not found."
+                texts = dict(labels or {})
+                texts.setdefault("PL", wdesc or aw)
+                try:
+                    content_g, tg_action = _ensure_translate(cur, texts)
+                except (ValueError, RuntimeError) as e:
+                    return f"Error (csTranslate): {e}"
+                max_id = _exec_scalar(
+                    cur,
+                    "select isnull(max(Id),0) from dbo.csAppMainMenusItems with(nolock) "
+                    "where csAppMainMenusG=? and csAppMainMenusParentItemsG=?",
+                    parent[1], parent[0],
+                )
+                parent_path = "" if parent[2] == "/" else (parent[2] or "")
+                row = {
+                    "_opr": "I", "csAppMainMenusItemsG": _new_guid(),
+                    "csAppMainMenusParentItemsG": str(parent[0]).upper(),
+                    "csAppMainMenusG": str(parent[1]).upper(),
+                    "Id": int(ord if ord is not None else int(max_id) + 1),
+                    "csAppWindowsG": None, "Kind": "NGDict", "IsQuick": 0,
+                    "appWindowIdent": aw, "csAppNameSpacesG": namespace_g,
+                    "ContentGuid": content_g,
+                    "childMenuPath": slug,
+                    "menuPath": menu_path or (parent_path + "/" + slug),
+                    "notShowInAppMenu": 0, "deprecated": 0, "usable": _as_int(usable),
+                }
+                for lang in NG_COLSGROUP_LANGS:
+                    if texts.get(lang):
+                        row[f"Content_{lang}"] = texts[lang]
+                mode = f"fresh entry under '{parent_menu_path}' (csTranslate {tg_action})"
+
+            collision = _exec_scalar(
+                cur,
+                "select count(*) from dbo.csAppMainMenusItems with(nolock) "
+                "where csAppMainMenusG=? and menuPath=?",
+                row["csAppMainMenusG"], row["menuPath"],
+            )
+            if collision:
+                return (f"Error: menuPath '{row['menuPath']}' already exists in this menu "
+                        f"(UQ csAppMainMenusG+menuPath). Pass menu_path explicitly.")
+            resp = _jsonsave(cur, "csAppMainMenusItemsJSONSave", [row])
+            if resp:
+                return f"csAppMainMenusItemsJSONSave ERROR:\n{resp}"
+            out.append(f"MENU: added NGDict entry for {aw} ({mode}) menuPath={row['menuPath']!r} "
+                       f"Id={row['Id']} usable={row['usable']}.")
+            if dict_row:
+                out.append("Dict entry left untouched (project rule: both entries coexist).")
+
+    if rebuild:
+        out.append(rebuild_user_rights(connection_string, cs_companies_id=cs_companies_id))
+    else:
+        out.append("REMINDER: rebuild_user_rights (menu cache) or the entry stays invisible.")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 27. ng_set_sort — SortIdents + LayoutsColsSortOrder in one call
+# ---------------------------------------------------------------------------
+
+def ng_set_sort(
+    connection_string: str,
+    app_window_ident: str,
+    columns: Sequence[dict],
+    data_set_ident: str = "main",
+    layout_ident: str = "default",
+    sort_ident: str = "default",
+    is_def: bool = True,
+    labels: Optional[dict] = None,
+    namespace_g: str = DEFAULT_NAMESPACE_G,
+) -> str:
+    """
+    Define/replace a sort for an NG dataset layout: upserts the SortIdents header and
+    REPLACES its LayoutsColsSortOrder column list. columns: [{field, desc?}] in order.
+    Rules handled: sort on a BUSINESS column (never <T>G), only one isDef=1 per layout
+    (others get isDef=0 first — filtered unique index), fields validated against
+    csNGAppWindowDataSetsFields. labels {PL,...} -> sortDesc_*.
+    """
+    aw = (app_window_ident or "").strip()
+    if not aw or not columns:
+        return "Error: app_window_ident and columns are required."
+    out: List[str] = []
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            for c in columns:
+                fi = (c.get("field") or "").strip()
+                if not fi:
+                    return f"Error: columns item without field: {c}"
+                if fi.lower().endswith("g") and fi.lower() == (aw.lower() + "g"):
+                    out.append(f"WARN: sorting on {fi} looks like the <T>G GUID — use a business column.")
+                known = _exec_scalar(
+                    cur,
+                    "select count(*) from dbo.csNGAppWindowDataSetsFields with(nolock) "
+                    "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and dataFieldIdent=?",
+                    namespace_g, aw, data_set_ident, fi,
+                )
+                if not known:
+                    return f"Error: field '{fi}' not found in {aw}.{data_set_ident} fields."
+
+            # unset other defaults (filtered UQ on isDef=1 per layout)
+            if is_def:
+                cur.execute(
+                    "select csNGAppWindowDataSetsSortIdentsId, csNGAppWindowDataSetsSortIdentsG, sortIdent "
+                    "from dbo.csNGAppWindowDataSetsSortIdents with(nolock) "
+                    "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and layoutIdent=? "
+                    "and isDef=1 and sortIdent<>?",
+                    namespace_g, aw, data_set_ident, layout_ident, sort_ident,
+                )
+                for r in cur.fetchall():
+                    resp = _jsonsave(cur, "csNGAppWindowDataSetsSortIdentsJSONSave", [{
+                        "_opr": "U", "csNGAppWindowDataSetsSortIdentsId": int(r[0]),
+                        "csNGAppWindowDataSetsSortIdentsG": str(r[1]).upper(), "isDef": 0,
+                    }])
+                    if resp:
+                        return f"SortIdentsJSONSave ERROR (unset default {r[2]}):\n{resp}"
+                    out.append(f"  isDef=0 on previous default '{r[2]}'")
+
+            cur.execute(
+                "select csNGAppWindowDataSetsSortIdentsId, csNGAppWindowDataSetsSortIdentsG "
+                "from dbo.csNGAppWindowDataSetsSortIdents with(nolock) "
+                "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and layoutIdent=? and sortIdent=?",
+                namespace_g, aw, data_set_ident, layout_ident, sort_ident,
+            )
+            hdr = cur.fetchone()
+            row = {
+                "_opr": "U" if hdr else "I",
+                "csNGAppWindowDataSetsSortIdentsG": str(hdr[1]).upper() if hdr else _new_guid(),
+                "csAppNameSpacesG": namespace_g, "appWindowIdent": aw,
+                "dataSetIdent": data_set_ident, "layoutIdent": layout_ident,
+                "sortIdent": sort_ident, "isDef": _as_int(is_def),
+            }
+            if hdr:
+                row["csNGAppWindowDataSetsSortIdentsId"] = int(hdr[0])
+            else:
+                max_ord = _exec_scalar(
+                    cur,
+                    "select isnull(max(ord),0) from dbo.csNGAppWindowDataSetsSortIdents with(nolock) "
+                    "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and layoutIdent=?",
+                    namespace_g, aw, data_set_ident, layout_ident,
+                )
+                row["ord"] = int(max_ord) + 1
+            for lang, val in (labels or {}).items():
+                if lang in NG_LABEL_LANGS and val:
+                    row[f"sortDesc_{lang}"] = val
+            resp = _jsonsave(cur, "csNGAppWindowDataSetsSortIdentsJSONSave", [row])
+            if resp:
+                return f"SortIdentsJSONSave ERROR:\n{resp}"
+            out.append(f"SORT {aw}.{data_set_ident}.{layout_ident}.{sort_ident}: "
+                       f"{'updated' if hdr else 'created'} (isDef={row['isDef']}).")
+
+            # replace column list
+            cur.execute(
+                "select csNGAppWindowDataSetsLayoutsColsSortOrderId, csNGAppWindowDataSetsLayoutsColsSortOrderG "
+                "from dbo.csNGAppWindowDataSetsLayoutsColsSortOrder with(nolock) "
+                "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and layoutIdent=? and sortIdent=?",
+                namespace_g, aw, data_set_ident, layout_ident, sort_ident,
+            )
+            old = cur.fetchall()
+            if old:
+                resp = _jsonsave(cur, "csNGAppWindowDataSetsLayoutsColsSortOrderJSONSave", [{
+                    "_opr": "D",
+                    "csNGAppWindowDataSetsLayoutsColsSortOrderId": int(r[0]),
+                    "csNGAppWindowDataSetsLayoutsColsSortOrderG": str(r[1]).upper(),
+                } for r in old])
+                if resp:
+                    return f"LayoutsColsSortOrderJSONSave DELETE ERROR:\n{resp}"
+            new_rows = [{
+                "_opr": "I",
+                "csNGAppWindowDataSetsLayoutsColsSortOrderG": _new_guid(),
+                "csAppNameSpacesG": namespace_g, "appWindowIdent": aw,
+                "dataSetIdent": data_set_ident, "layoutIdent": layout_ident,
+                "sortIdent": sort_ident, "dataFieldIdent": c["field"].strip(),
+                "ord": i + 1, "isDesc": _as_int(bool(c.get("desc"))), "sortType": 0,
+            } for i, c in enumerate(columns)]
+            resp = _jsonsave(cur, "csNGAppWindowDataSetsLayoutsColsSortOrderJSONSave", new_rows)
+            if resp:
+                return f"LayoutsColsSortOrderJSONSave INSERT ERROR:\n{resp}"
+            out.append("  columns: " + ", ".join(
+                f"{c['field'].strip()}{' DESC' if c.get('desc') else ''}" for c in columns)
+                + f" (replaced {len(old)} old row(s))")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 28. ng_diff_with_dict — migration gap report NG window vs Dict/table context
+# ---------------------------------------------------------------------------
+
+def ng_diff_with_dict(
+    connection_string: str,
+    app_window_ident: str,
+    dict_app_window: Optional[str] = None,
+    table_name: Optional[str] = None,
+    data_set_ident: str = "main",
+    namespace_g: str = DEFAULT_NAMESPACE_G,
+) -> str:
+    """
+    Read-only migration gap report: compares the NG window against the Dict/table
+    context (csNGDictWindowContextForAI) + the Dict window anatomy (AppWindowXML):
+      - suggested-visible table fields missing from the NG default layout,
+      - FK lookups proposed by the context but not wired in LookupDefs,
+      - default sort presence (and <T>G-sort warning),
+      - where-fields / filter presence,
+      - Dict datasets (from AppWindowXML) vs NG datasets.
+    Complements csNGValidateWindowForAI (config sanity) with FIDELITY-to-Dict checks.
+    """
+    aw = (app_window_ident or "").strip()
+    if not aw:
+        return "Error: app_window_ident is required."
+    dict_name = (dict_app_window or aw).strip()
+    out: List[str] = [f"DIFF {aw} (NG) vs '{dict_name}' (Dict/table context)"]
+
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # --- context proc (result sets tagged by 'section' column) ---
+            meta, ctx_fields, fk_lookups = {}, [], []
+            cur.execute("exec dbo.csNGDictWindowContextForAI @appWindow=?, @tableName=?",
+                        dict_name, table_name)
+            while True:
+                if cur.description:
+                    cols = [d[0] for d in cur.description]
+                    for r in cur.fetchall():
+                        rec = dict(zip(cols, r))
+                        sec = rec.get("section")
+                        if sec == "meta":
+                            meta = rec
+                        elif sec == "field":
+                            ctx_fields.append(rec)
+                        elif sec == "fkLookup":
+                            fk_lookups.append(rec)
+                if not cur.nextset():
+                    break
+            if meta:
+                out.append(f"META: existsInDict={meta.get('existsInDict')} existsInNG={meta.get('existsInNG')} "
+                           f"table={meta.get('tableName')} pk={meta.get('pkColumns')}")
+
+            # --- NG side ---
+            cur.execute(
+                "select lc.dataFieldIdent from dbo.csNGAppWindowDataSetsLayoutsCols lc with(nolock) "
+                "where lc.csAppNameSpacesG=? and lc.appWindowIdent=? and lc.dataSetIdent=? and lc.isVisible=1",
+                namespace_g, aw, data_set_ident,
+            )
+            ng_visible = {r[0] for r in cur.fetchall()}
+            cur.execute(
+                "select dataFieldIdent from dbo.csNGAppWindowDataSetsFields with(nolock) "
+                "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=?",
+                namespace_g, aw, data_set_ident,
+            )
+            ng_fields = {r[0] for r in cur.fetchall()}
+            if not ng_fields:
+                out.append(f"NG: dataset {aw}.{data_set_ident} has NO fields (window missing or empty).")
+
+            # 1. suggested-visible fields not visible in NG
+            missing_vis = [f["dataFieldIdent"] for f in ctx_fields
+                           if f.get("suggestedIsVisible") and f["dataFieldIdent"] not in ng_visible]
+            extra_vis = sorted(ng_visible - {f["dataFieldIdent"] for f in ctx_fields}) if ctx_fields else []
+            if missing_vis:
+                out.append(f"FIELDS missing from NG visible layout ({len(missing_vis)}): " + ", ".join(missing_vis))
+            elif ctx_fields:
+                out.append("FIELDS: all suggested-visible table columns are visible in NG.")
+            if extra_vis:
+                out.append(f"FIELDS visible in NG beyond table columns (computed/joins — OK if intended): "
+                           + ", ".join(extra_vis))
+
+            # 2. FK lookups not wired
+            cur.execute(
+                "select dataFieldIdent from dbo.csNGAppWindowDataSetsLookupDefs with(nolock) "
+                "where csAppNameSpacesG=? and appWindowIdent=?", namespace_g, aw)
+            wired = {r[0].lower() for r in cur.fetchall()}
+            for fk in fk_lookups:
+                col = (fk.get("lookupColumn") or "")
+                host_variants = {col.lower(), col.lower().replace("id", "desc"),
+                                 (col[:-2] + "Desc").lower() if col.lower().endswith("id") else col.lower()}
+                if col and not (host_variants & wired) and col in ng_fields:
+                    mark = "" if fk.get("hasLookupNGWindow") else " (lookup window MISSING too)"
+                    out.append(f"LOOKUP not wired: {col} -> {fk.get('proposedLookupNGIdent')}{mark}")
+
+            # 3. sort
+            cur.execute(
+                "select si.sortIdent, so.dataFieldIdent from dbo.csNGAppWindowDataSetsSortIdents si with(nolock) "
+                "left join dbo.csNGAppWindowDataSetsLayoutsColsSortOrder so with(nolock) "
+                "  on so.csAppNameSpacesG=si.csAppNameSpacesG and so.appWindowIdent=si.appWindowIdent "
+                "  and so.dataSetIdent=si.dataSetIdent and so.layoutIdent=si.layoutIdent and so.sortIdent=si.sortIdent "
+                "where si.csAppNameSpacesG=? and si.appWindowIdent=? and si.dataSetIdent=? and si.isDef=1",
+                namespace_g, aw, data_set_ident,
+            )
+            sort_rows = cur.fetchall()
+            if not sort_rows:
+                out.append("SORT: NO default sort (add ng_set_sort — required for every NG window).")
+            else:
+                sort_cols = [r[1] for r in sort_rows if r[1]]
+                out.append(f"SORT: default '{sort_rows[0][0]}' on: {', '.join(sort_cols) or '(no columns!)'}")
+                if any((c or "").lower() == (aw.lower() + "g") for c in sort_cols):
+                    out.append("SORT WARN: sorted by <T>G — use a business column.")
+
+            # 4. filters
+            wf_cnt = _exec_scalar(
+                cur,
+                "select count(*) from dbo.csNGAppWindowDataSetsWhereFields with(nolock) "
+                "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=?",
+                namespace_g, aw, data_set_ident)
+            out.append(f"FILTERS: {wf_cnt} where-field(s) on {data_set_ident}"
+                       + (" — none; Dict windows almost always filter (check the original)." if not wf_cnt else ""))
+
+            # 5. Dict datasets vs NG datasets
+            xml = _exec_scalar(
+                cur,
+                "select top 1 cast(AppWindowXML as nvarchar(max)) from dbo.csAppWindows with(nolock) "
+                "where AppWindow=? order by len(cast(AppWindowViewHTML as nvarchar(max))) desc",
+                dict_name)
+            if xml:
+                dict_ds = list(dict.fromkeys(
+                    re.findall(r"<DataSetSQLIdent>([^<]+)</DataSetSQLIdent>", xml)))
+                cur.execute(
+                    "select dataSetIdent from dbo.csNGAppWindowDataSets with(nolock) "
+                    "where csAppNameSpacesG=? and appWindowIdent=?", namespace_g, aw)
+                ng_ds = [r[0] for r in cur.fetchall()]
+                shown = ", ".join(dict_ds[:40]) + (f", ... (+{len(dict_ds) - 40})" if len(dict_ds) > 40 else "")
+                out.append(f"DATASETS Dict({len(dict_ds)} unikalnych): {shown or '-'}")
+                out.append(f"DATASETS NG({len(ng_ds)}): {', '.join(ng_ds) or '-'}")
+                out.append("HINT: pełna anatomia formatki Dict (kolumny/filtry/zakładki): "
+                           f"rag_get_dict_window_html('{dict_name}').")
+            else:
+                out.append(f"DICT: no csAppWindows row named '{dict_name}' (pure-table window / different name).")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 29. help_upsert_topic — csHelpContents + window links in one call
+# ---------------------------------------------------------------------------
+
+def help_upsert_topic(
+    connection_string: str,
+    subject,
+    content=None,
+    description=None,
+    keywords=None,
+    window_idents: Optional[Sequence[str]] = None,
+    help_contents_g: Optional[str] = None,
+    namespace_g: str = DEFAULT_NAMESPACE_G,
+) -> str:
+    """
+    Upsert a help topic (csHelpContents) and link it to NG windows
+    (csHelpContentsNGAppWindows). subject/content/description/keywords: either a
+    plain string (=PL) or {PL, EN, ...}. Matching: help_contents_g, else Subject_PL.
+    Pitfall handled: images must be INLINE base64 in Content_* (external URLs in
+    TransformedContent_* do not render) — external <img src="http..."> triggers a WARN.
+    """
+    def _langs(val, allowed):
+        if val is None:
+            return {}
+        if isinstance(val, str):
+            return {"PL": val}
+        return {k: v for k, v in val.items() if k in allowed and v}
+
+    subj = _langs(subject, NG_COLSGROUP_LANGS)
+    cont = _langs(content, NG_COLSGROUP_LANGS)
+    desc = _langs(description, NG_COLSGROUP_LANGS)
+    keyw = _langs(keywords, NG_COLSGROUP_LANGS)
+    if not subj.get("PL") and not help_contents_g:
+        return "Error: subject PL (or help_contents_g) is required."
+
+    out: List[str] = []
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            row_id = row_g = None
+            if help_contents_g:
+                cur.execute(
+                    "select csHelpContentsId, csHelpContentsG from dbo.csHelpContents with(nolock) "
+                    "where csHelpContentsG=?", help_contents_g)
+                r = cur.fetchone()
+                if not r:
+                    return f"Error: csHelpContentsG={help_contents_g} not found."
+                row_id, row_g = int(r[0]), str(r[1]).upper()
+            elif subj.get("PL"):
+                cur.execute(
+                    "select csHelpContentsId, csHelpContentsG from dbo.csHelpContents with(nolock) "
+                    "where Subject_PL=?", subj["PL"])
+                r = cur.fetchone()
+                if r:
+                    row_id, row_g = int(r[0]), str(r[1]).upper()
+
+            payload: dict = {}
+            for lang, v in subj.items():
+                payload[f"Subject_{lang}"] = v
+            for lang, v in cont.items():
+                payload[f"Content_{lang}"] = v
+                if re.search(r"<img[^>]+src=[\"']https?://", v, re.I):
+                    out.append(f"WARN: Content_{lang} contains EXTERNAL <img> URLs — inline base64 "
+                               "(Content_*) is the only variant that renders in the help panel.")
+            for lang, v in desc.items():
+                payload[f"Description_{lang}"] = v
+            for lang, v in keyw.items():
+                payload[f"keyWords_{lang}"] = v
+
+            if row_g:
+                if payload:
+                    payload.update({"_opr": "U", "csHelpContentsId": row_id, "csHelpContentsG": row_g})
+                    resp = _jsonsave(cur, "csHelpContentsJSONSave", [payload])
+                    if resp:
+                        return f"csHelpContentsJSONSave ERROR:\n{resp}"
+                    out.append(f"TOPIC updated: {row_g} ({subj.get('PL', '(no subject change)')}).")
+                else:
+                    out.append(f"TOPIC exists: {row_g} (nothing to update).")
+            else:
+                row_g = _new_guid()
+                payload.update({"_opr": "I", "csHelpContentsG": row_g, "IsExternalEditor": 0})
+                # INSERT requires Description_PL ('Proszę uzupełnić pole [Opis]')
+                if not payload.get("Description_PL"):
+                    payload["Description_PL"] = subj.get("PL")
+                resp = _jsonsave(cur, "csHelpContentsJSONSave", [payload])
+                if resp:
+                    return f"csHelpContentsJSONSave ERROR:\n{resp}"
+                out.append(f"TOPIC created: {row_g} '{subj['PL']}'.")
+
+            for w in (window_idents or []):
+                w = (w or "").strip()
+                known = _exec_scalar(
+                    cur, "select count(*) from dbo.csNGAppWindows with(nolock) "
+                         "where csAppNameSpacesG=? and appWindowIdent=?", namespace_g, w)
+                if not known:
+                    out.append(f"  LINK SKIPPED: NG window '{w}' not found.")
+                    continue
+                dup = _exec_scalar(
+                    cur, "select count(*) from dbo.csHelpContentsNGAppWindows with(nolock) "
+                         "where csHelpContentsG=? and csAppNameSpacesG=? and appWindowIdent=?",
+                    row_g, namespace_g, w)
+                if dup:
+                    out.append(f"  LINK exists: {w}")
+                    continue
+                resp = _jsonsave(cur, "csHelpContentsNGAppWindowsJSONSave", [{
+                    "_opr": "I", "csHelpContentsNGAppWindowsG": _new_guid(),
+                    "csHelpContentsG": row_g, "csAppNameSpacesG": namespace_g,
+                    "appWindowIdent": w,
+                }])
+                if resp:
+                    return f"csHelpContentsNGAppWindowsJSONSave ERROR ({w}):\n{resp}"
+                out.append(f"  LINK added: {w}")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 30. ai_tool_register — AI tool + params + agent attachment in one call
+# ---------------------------------------------------------------------------
+
+def ai_tool_register(
+    connection_string: str,
+    name: str,
+    description: Optional[str] = None,
+    sql_procedure: Optional[str] = None,
+    tool_type: str = "function",
+    params: Optional[Sequence[dict]] = None,
+    agents: Optional[Sequence] = None,
+    use_permissions: Optional[bool] = None,
+) -> str:
+    """
+    Register an AI tool end-to-end: csAIAgentsTools upsert (matched by SQLProcedure or
+    name) + parameter sync (delegates to ai_tool_sync_params, all its pitfalls handled)
+    + ATTACHMENT to agents via csAIAgentsToolsAgents — the chronically forgotten step
+    (a registered but unattached tool is invisible to every agent).
+    agents: list of agent names or csAIAgentsId (int); each attachment takes
+    csCompaniesId from the agent row.
+    """
+    nm = (name or "").strip()
+    if not nm:
+        return "Error: name is required."
+    out: List[str] = []
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            proc = (sql_procedure or "").strip()
+            if proc and not proc.lower().startswith("dbo."):
+                proc = "dbo." + proc
+            if proc:
+                if not _exec_scalar(cur, "select object_id(?)", proc):
+                    return f"Error: procedure '{proc}' does not exist — deploy it first (deploy_sql_object)."
+
+            cur.execute(
+                "select csAIAgentsToolsId, csAIAgentsToolsG, name, SQLProcedure, type, description "
+                "from dbo.csAIAgentsTools with(nolock) where name=? or (SQLProcedure in (?, ?) and ?<>N'')",
+                nm, proc, proc[4:] if proc else "", proc,
+            )
+            t = cur.fetchone()
+            row: dict = {"name": nm, "type": tool_type}
+            if description is not None:
+                row["description"] = description
+            if proc:
+                row["SQLProcedure"] = proc
+            if use_permissions is not None:
+                row["usePermissions"] = _as_int(use_permissions)
+            if t:
+                row.update({"_opr": "U", "csAIAgentsToolsId": int(t[0]),
+                            "csAIAgentsToolsG": str(t[1]).upper(),
+                            "SQLProcedure": proc or t[3], "type": tool_type or t[4]})
+                if description is None:
+                    row["description"] = t[5]
+                tool_g = str(t[1]).upper()
+                mode = "updated"
+            else:
+                if not proc:
+                    return "Error: sql_procedure is required to register a NEW tool."
+                tool_g = _new_guid()
+                row.update({"_opr": "I", "csAIAgentsToolsG": tool_g})
+                mode = "created"
+            resp = _jsonsave(cur, "csAIAgentsToolsJSONSave", [row])
+            if resp:
+                return f"csAIAgentsToolsJSONSave ERROR:\n{resp}"
+            out.append(f"TOOL {nm}: {mode} (G={tool_g}, proc={proc or (t[3] if t else '?')}).")
+
+            # --- attach to agents ---
+            for a in (agents or []):
+                if isinstance(a, dict):
+                    a = a.get("agent") or a.get("name") or a.get("csAIAgentsId")
+                cur.execute(
+                    "select csAIAgentsId, csCompaniesId, name from dbo.csAIAgents with(nolock) "
+                    "where name = ? or (csAIAgentsId = try_convert(bigint, ?))",
+                    str(a), str(a),
+                )
+                found = cur.fetchall()
+                if not found:
+                    out.append(f"  ATTACH SKIPPED: agent '{a}' not found.")
+                    continue
+                if len(found) > 1:
+                    out.append(f"  ATTACH AMBIGUOUS: '{a}' matches {len(found)} agents "
+                               f"({', '.join(str(r[0]) for r in found)}) — pass csAIAgentsId.")
+                    continue
+                agent_id, comp_id, agent_name = int(found[0][0]), int(found[0][1]), found[0][2]
+                dup = _exec_scalar(
+                    cur, "select count(*) from dbo.csAIAgentsToolsAgents with(nolock) "
+                         "where csAIAgentsId=? and csAIAgentsToolsG=?", agent_id, tool_g)
+                if dup:
+                    out.append(f"  ATTACHED already: {agent_name} ({agent_id}).")
+                    continue
+                resp = _jsonsave(cur, "csAIAgentsToolsAgentsJSONSave", [{
+                    "_opr": "I", "csAIAgentsToolsAgentsG": _new_guid(),
+                    "csCompaniesId": comp_id, "csAIAgentsId": agent_id,
+                    "csAIAgentsToolsG": tool_g,
+                }])
+                if resp:
+                    return f"csAIAgentsToolsAgentsJSONSave ERROR ({agent_name}):\n{resp}"
+                out.append(f"  ATTACHED: {agent_name} ({agent_id}, company {comp_id}).")
+
+    if params is not None:
+        out.append(ai_tool_sync_params(connection_string, nm, params, generate_sync_script=False))
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 31. ng_create_lookup_window — project-convention lookup generator + post-fixes
+# ---------------------------------------------------------------------------
+
+def ng_create_lookup_window(
+    connection_string: str,
+    table_name: str,
+    visible_fields: Optional[Sequence[str]] = None,
+    run_validator: bool = True,
+    namespace_g: str = DEFAULT_NAMESPACE_G,
+) -> str:
+    """
+    Create a dedicated lookup window '<Table>Lookup' via csCreateNGDictFromTableDef
+    (@DictType='lookup') and fix the classic auto-gen pitfalls:
+      - viewHTML must be NULL (empty string -> 'window has no template'),
+      - onlyAsLookup=1,
+      - at least one VISIBLE layout column (c-list renders visible LayoutsCols;
+        none visible = empty rows) — visible_fields sets them, otherwise the first
+        string field is made visible.
+    Then runs csNGValidateWindowForAI. Wire the lookup on the host window with
+    ng_add_lookup afterwards (this tool only creates the lookup window itself).
+    Idempotent: the generator skips every existing element (where not exists).
+    """
+    tbl = (table_name or "").strip()
+    if not tbl:
+        return "Error: table_name is required."
+    ident = tbl + "Lookup"
+    out: List[str] = []
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            tg = _exec_scalar(cur, "select csSysTablesG from dbo.csSysTables with(nolock) where tableName=?", tbl)
+            if not tg:
+                return f"Error: table '{tbl}' not registered in csSysTables."
+            pre_existing = _exec_scalar(
+                cur, "select count(*) from dbo.csNGAppWindows with(nolock) "
+                     "where csAppNameSpacesG=? and appWindowIdent=?", namespace_g, ident)
+
+            cur.execute(
+                "declare @response xml; "
+                "exec dbo.csCreateNGDictFromTableDef @csSysTablesG=?, @DictType=N'lookup', @response=@response out; "
+                "select convert(nvarchar(max), @response);", tg)
+            resp = cur.fetchone()
+            resp_txt = _xml_response_to_text(resp[0] if resp else None)
+            if resp_txt and "message_type=\"1\"" in resp_txt.replace("'", '"'):
+                return f"csCreateNGDictFromTableDef ERROR:\n{resp_txt}"
+            out.append(f"GENERATOR: {'window existed — elements completed idempotently' if pre_existing else 'lookup window created'} ({ident}).")
+
+            # --- post-fixes ---
+            cur.execute(
+                "select csNGAppWindowsId, csNGAppWindowsG, onlyAsLookup, viewHTML "
+                "from dbo.csNGAppWindows with(nolock) where csAppNameSpacesG=? and appWindowIdent=?",
+                namespace_g, ident)
+            w = cur.fetchone()
+            if not w:
+                return "\n".join(out) + f"\nError: window '{ident}' still missing after generator run."
+            fix: dict = {}
+            if w[3] is not None and not (w[3] or "").strip():
+                fix["viewHTML"] = None
+            if not w[2]:
+                fix["onlyAsLookup"] = 1
+            if fix:
+                fix.update({"_opr": "U", "csNGAppWindowsId": int(w[0]),
+                            "csNGAppWindowsG": str(w[1]).upper(),
+                            "csAppNameSpacesG": namespace_g, "appWindowIdent": ident})
+                resp2 = _jsonsave(cur, "csNGAppWindowsJSONSave", [fix])
+                if resp2:
+                    return "\n".join(out) + f"\ncsNGAppWindowsJSONSave ERROR:\n{resp2}"
+                out.append(f"  fixed: {', '.join(k for k in fix if not k.startswith(('_', 'cs', 'app')))}")
+
+            vis_cnt = _exec_scalar(
+                cur, "select count(*) from dbo.csNGAppWindowDataSetsLayoutsCols with(nolock) "
+                     "where csAppNameSpacesG=? and appWindowIdent=? and isVisible=1", namespace_g, ident)
+            targets = list(visible_fields or [])
+            if not targets and not vis_cnt:
+                first_str = _exec_scalar(
+                    cur,
+                    "select top 1 dataFieldIdent from dbo.csNGAppWindowDataSetsFields with(nolock) "
+                    "where csAppNameSpacesG=? and appWindowIdent=? and formatType=N'string' "
+                    "and dataFieldIdent not like N'%G' order by ord", namespace_g, ident)
+                if first_str:
+                    targets = [first_str]
+            if targets:
+                cols = [{"field": f, "visible": 1, "ord": i + 1, "width": 240.0}
+                        for i, f in enumerate(targets)]
+                out.append("  layout: " + ng_bulk_layout(connection_string, ident, cols))
+            else:
+                out.append(f"  layout: {vis_cnt} visible column(s) — OK.")
+
+            no_header = _exec_scalar(
+                cur,
+                "select count(*) from dbo.csNGAppWindowDataSetsLayoutsCols lc with(nolock) "
+                "join dbo.csNGAppWindowDataSetsFields f with(nolock) on f.csAppNameSpacesG=lc.csAppNameSpacesG "
+                " and f.appWindowIdent=lc.appWindowIdent and f.dataSetIdent=lc.dataSetIdent "
+                " and f.dataFieldIdent=lc.dataFieldIdent "
+                "where lc.csAppNameSpacesG=? and lc.appWindowIdent=? and lc.isVisible=1 "
+                "and isnull(f.dataFieldColDesc_PL, N'') = N''", namespace_g, ident)
+            if no_header:
+                out.append(f"  WARN: {no_header} visible column(s) without col header (dataFieldColDesc_PL) "
+                           "— empty header in c-list; fix with ng_set_field_labels.")
+
+            if run_validator:
+                cur.execute(
+                    "declare @e int, @w int; "
+                    "exec dbo.csNGValidateWindowForAI @appWindow=?, @errorCount=@e out, @warningCount=@w out, @quiet=1; "
+                    "select @e, @w;", ident)
+                r = cur.fetchone()
+                out.append(f"VALIDATOR: errors={r[0]}, warnings={r[1]}"
+                           + (" — run csNGValidateWindowForAI without @quiet for details." if (r[0] or r[1]) else ""))
+    out.append(f"NEXT: wire on the host window: ng_add_lookup(..., lookup_window_ident='{ident}').")
+    return "\n".join(out)
+
+
 CS_TOOL_NAMES = {
     "deploy_sql_object",
     "cs_jsonsave",
@@ -2364,6 +3564,14 @@ CS_TOOL_NAMES = {
     "ng_register_translates",
     "ng_add_linked_window",
     "ng_add_filter",
+    "ng_add_action",
+    "ng_ensure_privileges",
+    "ng_add_menu_entry",
+    "ng_set_sort",
+    "ng_diff_with_dict",
+    "help_upsert_topic",
+    "ai_tool_register",
+    "ng_create_lookup_window",
 }
 
 
@@ -2864,6 +4072,209 @@ def tool_descriptors():
                 "required": ["app_window_ident", "field_ident", "lookup_window_ident"],
             },
         ),
+        Tool(
+            name="ng_add_action",
+            description=(
+                "Register/update an NG dataset action with conventions handled: crud='ins'|'upd'|'del' "
+                "presets the standard auto-action flags; custom action gets isAuto=0/ord=max+1/"
+                "position='default'. labels {PL,EN,..} -> actionDesc_*. fields -> ActionsFields. "
+                "Wires granular ActionsPrivileges automatically. Reminds/performs the rights-cache "
+                "rebuild (button invisible without it)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string"},
+                    "action_ident": {"type": "string"},
+                    "data_set_ident": {"type": "string", "description": "Default 'main'."},
+                    "labels": {"type": "object", "description": "{PL,EN,..} -> actionDesc_*."},
+                    "sql_name": {"type": "string", "description": "SQLName, e.g. 'dbo.csFooJSONSave' or a dispatcher proc."},
+                    "kind": {"type": "string"},
+                    "crud": {"type": "string", "enum": ["ins", "upd", "del"], "description": "Standard CRUD preset."},
+                    "show_view": {"type": "boolean", "description": "1 = action opens a form (.vue)."},
+                    "view_html": {"type": "string", "description": "Action form template (implies showView=1)."},
+                    "ord": {"type": "integer"},
+                    "hide_when_empty": {"type": "boolean"},
+                    "show_confirmation": {"type": "boolean"},
+                    "add_current_row": {"type": "boolean"},
+                    "add_where": {"type": "boolean"},
+                    "ref_kind": {"type": "integer"},
+                    "close_after_exec": {"type": "boolean"},
+                    "is_auto": {"type": "boolean"},
+                    "fields": {"type": "array", "items": {"type": "object"},
+                               "description": "[{dataFieldIdent, dataFieldValueDef?, dataFieldIdentForNewRowValue?}]"},
+                    "extra": {"type": "object", "description": "Extra column overrides (advanced)."},
+                    "wire_privileges": {"type": "boolean", "description": "Default true."},
+                    "rebuild": {"type": "boolean", "description": "Rebuild rights cache afterwards."},
+                    "cs_companies_id": {"type": "integer", "description": "Scope for the rebuild."},
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident", "action_ident"],
+            },
+        ),
+        Tool(
+            name="ng_ensure_privileges",
+            description=(
+                "Audit and repair NG window privileges: no csNGAppWindowsPrivileges row = eternal "
+                "spinner. Creates a full-rights privilege when missing (create_if_missing), reports/"
+                "fixes granular gaps (datasets/actions not covered — fix_gaps), grants to a user "
+                "(csCompaniesUsrsPrivileges) and rebuilds the rights cache."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string"},
+                    "create_if_missing": {"type": "boolean", "description": "Default true."},
+                    "privilege_desc_pl": {"type": "string", "description": "Default: window PL desc."},
+                    "privilege_desc_en": {"type": "string"},
+                    "privilege_group_pl": {"type": "string", "description": "Default 'DSM'."},
+                    "fix_gaps": {"type": "boolean", "description": "Insert missing granular dataset/action grants."},
+                    "grant_cs_usr_id": {"type": "integer"},
+                    "grant_cs_companies_id": {"type": "integer"},
+                    "grant_privilege_g": {"type": "string", "description": "Required when the window has >1 privilege."},
+                    "rebuild": {"type": "boolean"},
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident"],
+            },
+        ),
+        Tool(
+            name="ng_add_menu_entry",
+            description=(
+                "Add the NGDict menu entry for an NG window WITHOUT touching the Dict entry (project "
+                "rule: both coexist). Clones the Dict predecessor's entry when it exists (labels/"
+                "ContentGuid/parent/Id; menuPath slug via generator formula), otherwise creates a "
+                "fresh entry under parent_menu_path with labels (csTranslate reuse/create). "
+                "Idempotent; reminds/performs the menu cache rebuild."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string"},
+                    "dict_app_window": {"type": "string", "description": "Dict predecessor name (default = app_window_ident)."},
+                    "parent_menu_path": {"type": "string", "description": "menuPath of the parent node (fresh entries), e.g. '/rozrachunki'."},
+                    "labels": {"type": "object", "description": "{PL,EN,..} menu caption (fresh entries; overrides clone captions)."},
+                    "menu_path": {"type": "string", "description": "Explicit menuPath (default: parentPath + slug)."},
+                    "ord": {"type": "integer", "description": "Menu Id/order (default: clone source or max+1)."},
+                    "usable": {"type": "boolean", "description": "Default true."},
+                    "rebuild": {"type": "boolean"},
+                    "cs_companies_id": {"type": "integer", "description": "Scope for the rebuild."},
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident"],
+            },
+        ),
+        Tool(
+            name="ng_set_sort",
+            description=(
+                "Define/replace a dataset sort in one call: upserts SortIdents (single isDef=1 per "
+                "layout — others unset first) and REPLACES the LayoutsColsSortOrder column list. "
+                "columns: [{field, desc?}] in order; fields validated; warns on <T>G sort "
+                "(business column required)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string"},
+                    "columns": {"type": "array", "items": {"type": "object"}, "description": "[{field, desc?}]"},
+                    "data_set_ident": {"type": "string", "description": "Default 'main'."},
+                    "layout_ident": {"type": "string", "description": "Default 'default'."},
+                    "sort_ident": {"type": "string", "description": "Default 'default'."},
+                    "is_def": {"type": "boolean", "description": "Default true."},
+                    "labels": {"type": "object", "description": "{PL,EN,..} -> sortDesc_*."},
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident", "columns"],
+            },
+        ),
+        Tool(
+            name="ng_diff_with_dict",
+            description=(
+                "READ-ONLY migration gap report: NG window vs Dict/table context "
+                "(csNGDictWindowContextForAI + AppWindowXML). Reports: suggested-visible fields "
+                "missing from the NG layout, FK lookups not wired, default-sort presence "
+                "(<T>G warning), where-field/filter count, Dict vs NG datasets. Use after a "
+                "Dict->NG migration BEFORE declaring it complete."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string"},
+                    "dict_app_window": {"type": "string", "description": "Dict window name (default = app_window_ident)."},
+                    "table_name": {"type": "string", "description": "Source table (default: resolved by the context proc)."},
+                    "data_set_ident": {"type": "string", "description": "Default 'main'."},
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident"],
+            },
+        ),
+        Tool(
+            name="help_upsert_topic",
+            description=(
+                "Upsert a help topic (csHelpContents) + link it to NG windows "
+                "(csHelpContentsNGAppWindows) in one call. subject/content/description/keywords: "
+                "string (=PL) or {PL,EN,..}. Matches by help_contents_g or Subject_PL. WARNs on "
+                "external <img> URLs (only inline base64 in Content_* renders)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "subject": {"description": "String (PL) or {PL,EN,..}."},
+                    "content": {"description": "HTML string (PL) or {PL,EN,..}; images inline base64."},
+                    "description": {"description": "String or {PL,EN,..}."},
+                    "keywords": {"description": "String or {PL,EN,..}."},
+                    "window_idents": {"type": "array", "items": {"type": "string"},
+                                      "description": "NG windows to link the topic to."},
+                    "help_contents_g": {"type": "string", "description": "Existing topic GUID (update mode)."},
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["subject"],
+            },
+        ),
+        Tool(
+            name="ai_tool_register",
+            description=(
+                "Register an AI tool end-to-end: csAIAgentsTools upsert (match by SQLProcedure/name) "
+                "+ params sync (ai_tool_sync_params pitfalls handled) + ATTACH to agents via "
+                "csAIAgentsToolsAgents — the chronically forgotten step (unattached tool = invisible "
+                "to every agent). agents: names or csAIAgentsId."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Tool name (usually = proc name without dbo.)."},
+                    "description": {"type": "string", "description": "What the tool does (for the LLM)."},
+                    "sql_procedure": {"type": "string", "description": "Backing procedure (dbo. optional). Required for new tools."},
+                    "tool_type": {"type": "string", "description": "Default 'function'."},
+                    "params": {"type": "array", "items": {"type": "object"},
+                               "description": "[{name, type, description, isRequired?, typeJSON?}] — synced via ai_tool_sync_params."},
+                    "agents": {"type": "array", "items": {}, "description": "Agent names or csAIAgentsId to attach the tool to."},
+                    "use_permissions": {"type": "boolean"},
+                },
+                "required": ["name"],
+            },
+        ),
+        Tool(
+            name="ng_create_lookup_window",
+            description=(
+                "Create a dedicated lookup window '<Table>Lookup' via csCreateNGDictFromTableDef "
+                "(@DictType='lookup') and fix the auto-gen pitfalls: viewHTML NULL (not ''), "
+                "onlyAsLookup=1, at least one VISIBLE layout column (else empty rows in c-list), "
+                "col-header warning. Runs csNGValidateWindowForAI. Idempotent. Wire the host field "
+                "afterwards with ng_add_lookup."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_name": {"type": "string", "description": "Source cs* table, e.g. 'csHolidays'."},
+                    "visible_fields": {"type": "array", "items": {"type": "string"},
+                                       "description": "Columns to show in the lookup list (default: first string field)."},
+                    "run_validator": {"type": "boolean", "description": "Default true."},
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["table_name"],
+            },
+        ),
     ]
 
 
@@ -3109,6 +4520,121 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             lookup_window_ident=arguments.get("lookup_window_ident"),
             lookup_sets=arguments.get("lookup_sets"),
             lookup_gets=arguments.get("lookup_gets"),
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "ng_add_action":
+        return ng_add_action(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            action_ident=arguments.get("action_ident", ""),
+            data_set_ident=arguments.get("data_set_ident") or "main",
+            labels=arguments.get("labels"),
+            sql_name=arguments.get("sql_name"),
+            kind=arguments.get("kind"),
+            crud=arguments.get("crud"),
+            show_view=arguments.get("show_view"),
+            view_html=arguments.get("view_html"),
+            ord=arguments.get("ord"),
+            hide_when_empty=arguments.get("hide_when_empty"),
+            show_confirmation=arguments.get("show_confirmation"),
+            add_current_row=arguments.get("add_current_row"),
+            add_where=arguments.get("add_where"),
+            ref_kind=arguments.get("ref_kind"),
+            close_after_exec=arguments.get("close_after_exec"),
+            is_auto=arguments.get("is_auto"),
+            fields=arguments.get("fields"),
+            extra=arguments.get("extra"),
+            wire_privileges=bool(arguments.get("wire_privileges", True)),
+            rebuild=bool(arguments.get("rebuild", False)),
+            cs_companies_id=arguments.get("cs_companies_id"),
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "ng_ensure_privileges":
+        return ng_ensure_privileges(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            create_if_missing=bool(arguments.get("create_if_missing", True)),
+            privilege_desc_pl=arguments.get("privilege_desc_pl"),
+            privilege_desc_en=arguments.get("privilege_desc_en"),
+            privilege_group_pl=arguments.get("privilege_group_pl") or "DSM",
+            fix_gaps=bool(arguments.get("fix_gaps", False)),
+            grant_cs_usr_id=arguments.get("grant_cs_usr_id"),
+            grant_cs_companies_id=arguments.get("grant_cs_companies_id"),
+            grant_privilege_g=arguments.get("grant_privilege_g"),
+            rebuild=bool(arguments.get("rebuild", False)),
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "ng_add_menu_entry":
+        return ng_add_menu_entry(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            dict_app_window=arguments.get("dict_app_window"),
+            parent_menu_path=arguments.get("parent_menu_path"),
+            labels=arguments.get("labels"),
+            menu_path=arguments.get("menu_path"),
+            ord=arguments.get("ord"),
+            usable=bool(arguments.get("usable", True)),
+            rebuild=bool(arguments.get("rebuild", False)),
+            cs_companies_id=arguments.get("cs_companies_id"),
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "ng_set_sort":
+        return ng_set_sort(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            columns=arguments.get("columns") or [],
+            data_set_ident=arguments.get("data_set_ident") or "main",
+            layout_ident=arguments.get("layout_ident") or "default",
+            sort_ident=arguments.get("sort_ident") or "default",
+            is_def=bool(arguments.get("is_def", True)),
+            labels=arguments.get("labels"),
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "ng_diff_with_dict":
+        return ng_diff_with_dict(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            dict_app_window=arguments.get("dict_app_window"),
+            table_name=arguments.get("table_name"),
+            data_set_ident=arguments.get("data_set_ident") or "main",
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "help_upsert_topic":
+        return help_upsert_topic(
+            connection_string,
+            subject=arguments.get("subject"),
+            content=arguments.get("content"),
+            description=arguments.get("description"),
+            keywords=arguments.get("keywords"),
+            window_idents=arguments.get("window_idents"),
+            help_contents_g=arguments.get("help_contents_g"),
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "ai_tool_register":
+        return ai_tool_register(
+            connection_string,
+            name=arguments.get("name", ""),
+            description=arguments.get("description"),
+            sql_procedure=arguments.get("sql_procedure"),
+            tool_type=arguments.get("tool_type") or "function",
+            params=arguments.get("params"),
+            agents=arguments.get("agents"),
+            use_permissions=arguments.get("use_permissions"),
+        )
+
+    if name == "ng_create_lookup_window":
+        return ng_create_lookup_window(
+            connection_string,
+            table_name=arguments.get("table_name", ""),
+            visible_fields=arguments.get("visible_fields"),
+            run_validator=bool(arguments.get("run_validator", True)),
             namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
         )
 
