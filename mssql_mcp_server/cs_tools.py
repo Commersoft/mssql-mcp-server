@@ -420,6 +420,8 @@ def add_ng_field(
     sql_column_params: Optional[str] = None,
     add_to_form: bool = True,
     width: float = 180.0,
+    is_translate: bool = False,
+    before_translate: Optional[str] = None,
     namespace_g: str = DEFAULT_NAMESPACE_G,
 ) -> str:
     """
@@ -428,8 +430,22 @@ def add_ng_field(
 
     Enforces: idempotent UPSERT, layout col requires labelDataSetIdent/labelDataFieldIdent
     and a non-null width (else the column silently collapses).
+
+    is_translate=True -> sets isTranslate=1 + dataFieldIdentBeforeTranslate (defaults to
+    '<field_ident>_'; a missing trailing '_' is auto-appended — the /*FIELDS*/ builder
+    concatenates it with the language suffix, so 'WarehouseDesc' would expand to the
+    non-existent column 'WarehouseDescPL').
     """
     log: List[str] = []
+    if before_translate and not is_translate:
+        return ("ERROR: before_translate given but is_translate is false — the /*FIELDS*/ builder "
+                "only uses dataFieldIdentBeforeTranslate when isTranslate=1 (would emit alias.field_ident).")
+    bt_prefix: Optional[str] = None
+    if is_translate:
+        bt_prefix = before_translate or field_ident
+        if not bt_prefix.endswith("_"):
+            bt_prefix += "_"
+            log.append(f"before_translate auto-suffixed to '{bt_prefix}'")
     with connect(connection_string, autocommit=True) as conn:
         with conn.cursor() as cur:
             # --- Field ---
@@ -466,9 +482,11 @@ def add_ng_field(
                 "formatType": format_type,
                 "SQLBaseType": sql_base_type,
                 "alias": alias,
-                "isTranslate": 0,
+                "isTranslate": 1 if is_translate else 0,
                 "addToSelect": 1,
             }
+            if bt_prefix:
+                field_row["dataFieldIdentBeforeTranslate"] = bt_prefix
             if f_id:
                 field_row["csNGAppWindowDataSetsFieldsId"] = int(f_id)
             if sql_column_params:
@@ -3916,7 +3934,9 @@ def tool_descriptors():
             description=(
                 "Add a field to an NG window: csNGAppWindowDataSetsFields + LayoutsCols "
                 "(+ optional <c-edit> injection into ins/upd viewHTML). Idempotent UPSERT; "
-                "sets labelDataFieldIdent and a non-null width to avoid silent collapse."
+                "sets labelDataFieldIdent and a non-null width to avoid silent collapse. "
+                "Translated fields (*Desc over *Desc_PL/EN columns): pass is_translate=true — "
+                "sets isTranslate=1 + dataFieldIdentBeforeTranslate with the mandatory trailing '_'."
             ),
             inputSchema={
                 "type": "object",
@@ -3932,6 +3952,8 @@ def tool_descriptors():
                     "sql_column_params": {"type": "string", "description": "e.g. '(200)', '(max)'."},
                     "add_to_form": {"type": "boolean", "description": "Inject <c-edit> into ins/upd viewHTML. Default true."},
                     "width": {"type": "number", "description": "Grid column width (default 180)."},
+                    "is_translate": {"type": "boolean", "description": "Translated field (*Desc_PL/EN... columns): isTranslate=1 + dataFieldIdentBeforeTranslate. Default false."},
+                    "before_translate": {"type": "string", "description": "Column prefix for translated field (default '<field_ident>_'; trailing '_' enforced). Only with is_translate."},
                 },
                 "required": ["app_window_ident", "field_ident", "format_type", "sql_base_type", "label_pl", "label_en"],
             },
@@ -4435,6 +4457,8 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             sql_column_params=arguments.get("sql_column_params"),
             add_to_form=arguments.get("add_to_form", True),
             width=float(arguments.get("width") or 180.0),
+            is_translate=bool(arguments.get("is_translate", False)),
+            before_translate=arguments.get("before_translate"),
         )
 
     if name == "get_cs_object_versions":
