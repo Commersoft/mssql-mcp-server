@@ -3214,6 +3214,97 @@ def ng_diff_with_dict(
 # 29. help_upsert_topic — csHelpContents + window links in one call
 # ---------------------------------------------------------------------------
 
+def _help_content_replace(conn, cur, row_id: int, row_g: str, payload: dict, cont: dict):
+    """csHelpContentsJSONSave U-path silently skips Content_*/TransformedContent_* (reports
+    success, persists nothing) — the only working edit is DELETE+re-INSERT with the same G.
+    Both link tables (csHelpContentsNGAppWindows, legacy csHelpContentsAppWindows) carry an
+    FK to csHelpContents, so links are detached first and re-inserted afterwards (same link
+    G), all inside one transaction. Returns (error_or_None, notes)."""
+    notes: List[str] = []
+    cur.execute("select * from dbo.csHelpContents with(nolock) where csHelpContentsId=?", row_id)
+    row = cur.fetchone()
+    if not row:
+        return (f"Error: csHelpContents row Id={row_id} not found.", notes)
+    cols = [d[0] for d in cur.description]
+    existing = {}
+    for c, v in zip(cols, row):
+        if c == "csHelpContentsId" or v is None:
+            continue
+        existing[c] = v if isinstance(v, (str, int, float, bool)) else str(v)
+    merged = dict(existing)
+    merged.update({k: v for k, v in payload.items() if k != "csHelpContentsId" and not k.startswith("_")})
+    # keep the legacy H5 renderer in sync: refresh TransformedContent only where it existed
+    for lang, v in cont.items():
+        if existing.get(f"TransformedContent_{lang}") is not None:
+            merged[f"TransformedContent_{lang}"] = v
+    merged["csHelpContentsG"] = row_g
+    merged.setdefault("IsExternalEditor", 0)
+
+    cur.execute(
+        "select csHelpContentsNGAppWindowsId, csHelpContentsNGAppWindowsG, csAppNameSpacesG, appWindowIdent "
+        "from dbo.csHelpContentsNGAppWindows with(nolock) where csHelpContentsG=?", row_g)
+    ng_links = [(int(r[0]), str(r[1]).upper(), str(r[2]).upper(), r[3]) for r in cur.fetchall()]
+    cur.execute(
+        "select csHelpContentsAppWindowsId, csHelpContentsAppWindowsG, csAppWindowsG "
+        "from dbo.csHelpContentsAppWindows with(nolock) where csHelpContentsG=?", row_g)
+    legacy_links = [(int(r[0]), str(r[1]).upper(), str(r[2]).upper()) for r in cur.fetchall()]
+
+    conn.autocommit = False
+    try:
+        # D of the auto-gen link tables needs the NATURAL key (Id+G alone = silent no-op)
+        for lid, lg, ns, wid in ng_links:
+            resp = _jsonsave(cur, "csHelpContentsNGAppWindowsJSONSave", [{
+                "_opr": "D", "csHelpContentsNGAppWindowsId": lid, "csHelpContentsNGAppWindowsG": lg,
+                "csHelpContentsG": row_g, "csAppNameSpacesG": ns, "appWindowIdent": wid}])
+            if resp:
+                raise RuntimeError(f"D NG link '{wid}': {resp}")
+        for lid, lg, awg in legacy_links:
+            resp = _jsonsave(cur, "csHelpContentsAppWindowsJSONSave", [{
+                "_opr": "D", "csHelpContentsAppWindowsId": lid, "csHelpContentsAppWindowsG": lg,
+                "csHelpContentsG": row_g, "csAppWindowsG": awg}])
+            if resp:
+                raise RuntimeError(f"D legacy link '{awg}': {resp}")
+        resp = _jsonsave(cur, "csHelpContentsJSONSave", [{
+            "_opr": "D", "csHelpContentsId": row_id, "csHelpContentsG": row_g}])
+        if resp:
+            raise RuntimeError(f"D content: {resp}")
+        merged["_opr"] = "I"
+        resp = _jsonsave(cur, "csHelpContentsJSONSave", [merged])
+        if resp:
+            raise RuntimeError(f"I content: {resp}")
+        for _lid, lg, ns, wid in ng_links:
+            resp = _jsonsave(cur, "csHelpContentsNGAppWindowsJSONSave", [{
+                "_opr": "I", "csHelpContentsNGAppWindowsG": lg,
+                "csHelpContentsG": row_g, "csAppNameSpacesG": ns, "appWindowIdent": wid}])
+            if resp:
+                raise RuntimeError(f"I NG link '{wid}': {resp}")
+        for _lid, lg, awg in legacy_links:
+            resp = _jsonsave(cur, "csHelpContentsAppWindowsJSONSave", [{
+                "_opr": "I", "csHelpContentsAppWindowsG": lg,
+                "csHelpContentsG": row_g, "csAppWindowsG": awg}])
+            if resp:
+                raise RuntimeError(f"I legacy link '{awg}': {resp}")
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.autocommit = True
+        return (f"CONTENT REPLACE ROLLED BACK (nothing changed): {exc}", notes)
+    conn.autocommit = True
+
+    # verify persisted lengths — the whole reason this workaround exists
+    for lang, v in cont.items():
+        expected = len(v.encode("utf-16-le")) // 2  # SQL len() counts UTF-16 units
+        got = _exec_scalar(
+            cur, f"select len(Content_{lang}) from dbo.csHelpContents with(nolock) where csHelpContentsG=?",
+            row_g)
+        if got != expected:
+            notes.append(f"WARN: Content_{lang} persisted len={got}, expected {expected} — verify manually.")
+    notes.append(
+        f"TOPIC content replaced: {row_g} via transactional D+I with the same G "
+        f"(U-path skips Content_*); links re-attached: NG={len(ng_links)}, legacy={len(legacy_links)}.")
+    return (None, notes)
+
+
 def help_upsert_topic(
     connection_string: str,
     subject,
@@ -3227,9 +3318,13 @@ def help_upsert_topic(
     """
     Upsert a help topic (csHelpContents) and link it to NG windows
     (csHelpContentsNGAppWindows). subject/content/description/keywords: either a
-    plain string (=PL) or {PL, EN, ...}. Matching: help_contents_g, else Subject_PL.
-    Pitfall handled: images must be INLINE base64 in Content_* (external URLs in
-    TransformedContent_* do not render) — external <img src="http..."> triggers a WARN.
+    plain string (=PL) or {PL, EN, ...}. Matching: help_contents_g, else Subject_PL;
+    an UNKNOWN help_contents_g creates the topic WITH that GUID (stable series like
+    0A5E18xx stay usable). Pitfalls handled: (1) content updates go through a
+    transactional DELETE+re-INSERT with the same G (links detached/re-attached),
+    because csHelpContentsJSONSave U-path silently skips Content_*/TransformedContent_*;
+    persisted length is verified afterwards; (2) images must be INLINE base64 in
+    Content_* (external URLs do not render) — external <img src="http..."> = WARN.
     """
     def _langs(val, allowed):
         if val is None:
@@ -3249,14 +3344,18 @@ def help_upsert_topic(
     with connect(connection_string, autocommit=True) as conn:
         with conn.cursor() as cur:
             row_id = row_g = None
+            requested_g = None
             if help_contents_g:
+                try:
+                    requested_g = str(uuid.UUID(str(help_contents_g))).upper()
+                except (ValueError, AttributeError, TypeError):
+                    return f"Error: help_contents_g '{help_contents_g}' is not a valid GUID."
                 cur.execute(
                     "select csHelpContentsId, csHelpContentsG from dbo.csHelpContents with(nolock) "
-                    "where csHelpContentsG=?", help_contents_g)
+                    "where csHelpContentsG=?", requested_g)
                 r = cur.fetchone()
-                if not r:
-                    return f"Error: csHelpContentsG={help_contents_g} not found."
-                row_id, row_g = int(r[0]), str(r[1]).upper()
+                if r:
+                    row_id, row_g = int(r[0]), str(r[1]).upper()
             elif subj.get("PL"):
                 cur.execute(
                     "select csHelpContentsId, csHelpContentsG from dbo.csHelpContents with(nolock) "
@@ -3279,7 +3378,13 @@ def help_upsert_topic(
                 payload[f"keyWords_{lang}"] = v
 
             if row_g:
-                if payload:
+                if cont:
+                    # U-path skips Content_* — replace the row transactionally (same G)
+                    err, notes = _help_content_replace(conn, cur, row_id, row_g, payload, cont)
+                    if err:
+                        return err
+                    out.extend(notes)
+                elif payload:
                     payload.update({"_opr": "U", "csHelpContentsId": row_id, "csHelpContentsG": row_g})
                     resp = _jsonsave(cur, "csHelpContentsJSONSave", [payload])
                     if resp:
@@ -3288,7 +3393,10 @@ def help_upsert_topic(
                 else:
                     out.append(f"TOPIC exists: {row_g} (nothing to update).")
             else:
-                row_g = _new_guid()
+                if not subj.get("PL"):
+                    return (f"Error: help_contents_g {requested_g} does not exist and no subject PL "
+                            "was given — cannot create a topic without a subject.")
+                row_g = requested_g or _new_guid()
                 payload.update({"_opr": "I", "csHelpContentsG": row_g, "IsExternalEditor": 0})
                 # INSERT requires Description_PL ('Proszę uzupełnić pole [Opis]')
                 if not payload.get("Description_PL"):
@@ -3296,7 +3404,8 @@ def help_upsert_topic(
                 resp = _jsonsave(cur, "csHelpContentsJSONSave", [payload])
                 if resp:
                     return f"csHelpContentsJSONSave ERROR:\n{resp}"
-                out.append(f"TOPIC created: {row_g} '{subj['PL']}'.")
+                out.append(f"TOPIC created: {row_g} '{subj['PL']}'"
+                           + (" (with the requested GUID)." if requested_g else "."))
 
             for w in (window_idents or []):
                 w = (w or "").strip()
@@ -4213,7 +4322,10 @@ def tool_descriptors():
             description=(
                 "Upsert a help topic (csHelpContents) + link it to NG windows "
                 "(csHelpContentsNGAppWindows) in one call. subject/content/description/keywords: "
-                "string (=PL) or {PL,EN,..}. Matches by help_contents_g or Subject_PL. WARNs on "
+                "string (=PL) or {PL,EN,..}. Matches by help_contents_g or Subject_PL; an UNKNOWN "
+                "help_contents_g creates the topic WITH that GUID (stable series). Content updates "
+                "run a transactional D+I with the same G (links re-attached, persisted length "
+                "verified) — csHelpContentsJSONSave U-path silently skips Content_*. WARNs on "
                 "external <img> URLs (only inline base64 in Content_* renders)."
             ),
             inputSchema={
@@ -4225,7 +4337,7 @@ def tool_descriptors():
                     "keywords": {"description": "String or {PL,EN,..}."},
                     "window_idents": {"type": "array", "items": {"type": "string"},
                                       "description": "NG windows to link the topic to."},
-                    "help_contents_g": {"type": "string", "description": "Existing topic GUID (update mode)."},
+                    "help_contents_g": {"type": "string", "description": "Topic GUID: existing → update; unknown → INSERT with this GUID (requires subject)."},
                     "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
                 },
                 "required": ["subject"],
