@@ -300,8 +300,8 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
         "database": "test04",
         "user_env": "CSTESTGRODNO_USER",
         "password_env": "CSTESTGRODNO_PWD",
-        "hard_readonly": True,
-        "hint": "Baza testowa — ZAWSZE read-only.",
+        "hard_readonly": False,
+        "hint": "Baza testowa Grodno (kopia PROD). Zapis wymaga allow_write=true (odblokowane 2026-07-16 dla testów wyszukiwarki).",
     },
 }
 
