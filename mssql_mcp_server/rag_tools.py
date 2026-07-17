@@ -816,7 +816,8 @@ def tool_descriptors():
             name="rag_get_sql_object",
             description=(
                 "Return the full text of a SQL object via dbo.csSysScriptSqlObject "
-                "(fallback to sys.sql_modules). Use after rag_search_sql."
+                "(fallback to sys.sql_modules). Use after rag_search_sql. Works on any "
+                "environment via `server` (default DEV) — handy to compare DEV vs PROD bodies."
             ),
             inputSchema={
                 "type": "object",
@@ -824,6 +825,11 @@ def tool_descriptors():
                     "object_name": {
                         "type": "string",
                         "description": "Object name, e.g. 'dbo.csCustomersJSONSave' or just 'csCustomersJSONSave'.",
+                    },
+                    "server": {
+                        "type": "string",
+                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO"],
+                        "description": "Target environment (default DEV).",
                     },
                 },
                 "required": ["object_name"],

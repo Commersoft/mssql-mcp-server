@@ -14,6 +14,10 @@ Tools:
                         parse @response xml into a readable result.
 - add_cs_column       : add a column to a cs* table (csSysColumnsJSONSave + rebuild),
                         auto ColumnOrder, full 12x ColumnDesc, both rebuild params.
+- register_cs_table   : register a table END-TO-END (csSysTables + csSysColumns 12-lang +
+                        csSysIndexes + rebuild + verification; managed auto Id/G + pk/uq).
+- register_job        : register a csCompaniesJobs job (stable G, dbo. prefix, JobOrder,
+                        weekly/daily interval conventions; cross-server via `server`).
 - add_ng_field        : add a field to an NG window (Fields + LayoutCols + optional
                         ins/upd viewHTML injection).
 - get_cs_object_versions : list csSysObjVer history + inProgress state for an object.
@@ -153,6 +157,8 @@ def deploy_sql_object(
     body: str,
     description: str,
     object_type: str = "procedure",
+    dev_connection_string: Optional[str] = None,
+    target_label: str = "DEV",
 ) -> str:
     """
     Deploy a SQL object through csAddObjVer with all version-mechanism pitfalls handled:
@@ -161,6 +167,13 @@ def deploy_sql_object(
       - @v = freshly generated, collision-checked GUID.
       - 3-batch deploy (csAddObjVer + DDL body + csSysRestoreObject), no GO sent to driver.
       - orphan cleanup: clears a stuck inProgress=1 row from a prior failed attempt (UPDATE only).
+
+    Multi-server (target_label != 'DEV', e.g. PROD): the version chain stays CONSISTENT —
+    @v on the target REUSES the latest DEV verG for the object (DEV registry = source of
+    truth), @pv = the target's own latest verG. Requires the object to be deployed on DEV
+    FIRST; if the DEV latest verG already exists on the target, the deploy is skipped
+    (idempotent). NEVER patch managed objects with raw ALTER — the registry then carries
+    the stale body and the next upgrade package ships the bug.
 
     `body` must be the CREATE statement only (e.g. "CREATE procedure dbo.<Name> (...) as begin ... end;").
     Do NOT include csAddObjVer / GO / csSysRestoreObject — they are generated here.
@@ -177,9 +190,39 @@ def deploy_sql_object(
 
     full_name = f"dbo.{name}"
     log: List[str] = []
+    is_cross = target_label.upper() != "DEV"
+
+    dev_latest = None
+    if is_cross:
+        if not dev_connection_string:
+            return "Error: cross-server deploy requires the DEV connection (internal)."
+        with connect(dev_connection_string, autocommit=True) as dconn:
+            with dconn.cursor() as dcur:
+                dev_latest = _exec_scalar(
+                    dcur,
+                    "select top 1 v.verG from dbo.csSysObjVer v with(nolock) "
+                    "where v.objectName = ? and v.inProgress = 0 order by v.verId desc",
+                    name,
+                )
+        if not dev_latest:
+            return (f"Error: '{name}' has no completed version on DEV — deploy on DEV first "
+                    f"(rejestr wersji DEV jest źródłem @v dla {target_label}).")
+        dev_latest = str(dev_latest).upper()
+        log.append(f"target = {target_label}; @v reused from DEV latest = {dev_latest}")
 
     with connect(connection_string, autocommit=True) as conn:
         with conn.cursor() as cur:
+            if is_cross:
+                already = _exec_scalar(
+                    cur,
+                    "select 1 from dbo.csSysObjVer with(nolock) "
+                    "where objectName = ? and verG = ? and inProgress = 0",
+                    name, dev_latest,
+                )
+                if already:
+                    return (f"SKIPPED: version {dev_latest} of {full_name} is already deployed "
+                            f"on {target_label} (idempotent).")
+
             # a) latest verG -> @pv
             latest_ver = _exec_scalar(
                 cur,
@@ -199,16 +242,19 @@ def deploy_sql_object(
             if cur.rowcount:
                 log.append(f"cleared {cur.rowcount} orphan inProgress row(s)")
 
-            # c) fresh unique @v (collision-checked against csSysObjVer.verG)
-            for _ in range(10):
-                v = _new_guid()
-                exists = _exec_scalar(
-                    cur, "select 1 from dbo.csSysObjVer where verG = ?", v
-                )
-                if not exists:
-                    break
+            # c) @v: cross-server = DEV latest verG; DEV = fresh unique GUID
+            if is_cross:
+                v = dev_latest
             else:
-                return "Error: could not generate a unique @v after 10 tries."
+                for _ in range(10):
+                    v = _new_guid()
+                    exists = _exec_scalar(
+                        cur, "select 1 from dbo.csSysObjVer where verG = ?", v
+                    )
+                    if not exists:
+                        break
+                else:
+                    return "Error: could not generate a unique @v after 10 tries."
             log.append(f"@v = {v}")
 
             # d) batch 1: csAddObjVer + optional drop
@@ -254,7 +300,8 @@ def deploy_sql_object(
     log.append(f"object exists in sys.objects: {bool(ok)}")
     log.append(f"inProgress rows left: {in_prog}")
     status = "DEPLOYED OK" if ok and not in_prog else "DEPLOYED WITH WARNINGS"
-    return f"{status}: {full_name}\n  " + "\n  ".join(log)
+    target_info = f" [{target_label}]" if is_cross else ""
+    return f"{status}{target_info}: {full_name}\n  " + "\n  ".join(log)
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +448,286 @@ def add_cs_column(
         f"OK: column {table_name}.{column_name} ({base_type}{column_params or ''}) "
         f"added at order {int(max_ord)+1}, physical={bool(phys)}."
     )
+
+
+# ---------------------------------------------------------------------------
+# 3b. register_cs_table — full table registration in one call
+# ---------------------------------------------------------------------------
+
+def _stable_guid(cur, seed: str) -> str:
+    """Deterministic GUID = convert(uniqueidentifier, hashbytes('MD5', seed)) —
+    same convention as manual registrations, so re-runs and manual work align."""
+    return str(_exec_scalar(
+        cur, "select convert(uniqueidentifier, hashbytes('MD5', convert(varchar(500), ?)))", seed
+    )).upper()
+
+
+def register_cs_table(
+    connection_string: str,
+    table_name: str,
+    columns: Sequence[dict],
+    indexes: Optional[Sequence[dict]] = None,
+    description_pl: Optional[str] = None,
+    description_en: Optional[str] = None,
+    is_managed: bool = False,
+    track_changes: bool = False,
+) -> str:
+    """
+    Register a cs* table end-to-end: csSysTablesJSONSave + csSysColumnsJSONSave
+    (full 12-language ColumnDesc enforced) + csSysIndexesJSONSave + csSysTablesRebuild
+    (both params) + physical verification. Idempotent: existing table/columns/indexes
+    are skipped, missing ones added, rebuild always runs.
+
+    columns: [{name, type, params?, nullable?, default?, desc: {EN,PL,DE,FR,ES,IT,NL,PT,RU,UK,SK,SE}}]
+      - `type` = bare SQL type ('bigint', 'nvarchar', 'numeric', ...), `params` like '(18,6)'.
+    indexes: [{name?, keys: 'col1[,col2...]' or [cols] or full '[c] asc,...', pk?, uq?, clustered?}]
+      - default for is_managed=True: pk clustered on <T>Id + unique on <T>G;
+      - for is_managed=False at least one index is required (aggregates need a clustered PK).
+    is_managed=True auto-prepends <T>Id (bigint) and <T>G (uniqueidentifier) columns when
+    missing from `columns` and generates the JSONSave procedure via rebuild.
+    GUIDs are deterministic (md5 'table:<T>' / 'col:<T>:<c>' / 'idx:<T>:<name>').
+    """
+    t = (table_name or "").strip()
+    if not t:
+        return "Error: table_name is required."
+    if not columns:
+        return "Error: columns list is required."
+
+    cols = [dict(c) for c in columns]
+    if is_managed:
+        have = {c.get("name") for c in cols}
+        auto = []
+        if f"{t}Id" not in have:
+            auto.append({"name": f"{t}Id", "type": "bigint", "nullable": False,
+                         "desc": {l: "ID" if l not in ("RU", "UK") else "ИД" if l == "RU" else "ІД"
+                                  for l in COLUMN_DESC_LANGS}})
+        if f"{t}G" not in have:
+            auto.append({"name": f"{t}G", "type": "uniqueidentifier", "nullable": False,
+                         "desc": {l: "IDG" for l in COLUMN_DESC_LANGS}})
+        cols = auto + cols
+
+    for c in cols:
+        if not c.get("name") or not c.get("type"):
+            return f"Error: each column needs name+type (got: {c})."
+        desc = c.get("desc") or {}
+        missing = [l for l in COLUMN_DESC_LANGS if not desc.get(l)]
+        if missing:
+            return (f"Error: column '{c['name']}' desc missing languages: {', '.join(missing)} "
+                    f"(all 12 required: {', '.join(COLUMN_DESC_LANGS)}).")
+
+    idxs = [dict(i) for i in (indexes or [])]
+    if not idxs:
+        if is_managed:
+            idxs = [
+                {"name": f"pk_{t}", "keys": f"[{t}Id] asc", "pk": True, "uq": True, "clustered": True},
+                {"name": f"uq_{t}_G", "keys": f"[{t}G] asc", "pk": False, "uq": True, "clustered": False},
+            ]
+        else:
+            return ("Error: indexes are required for a non-managed table "
+                    "(aggregates need at least a clustered PK).")
+
+    def _norm_keys(keys) -> str:
+        if isinstance(keys, (list, tuple)):
+            return ",".join(f"[{k}] asc" for k in keys)
+        s = str(keys).strip()
+        if "[" in s:
+            return s
+        return ",".join(f"[{p.strip()}] asc" for p in s.split(",") if p.strip())
+
+    out: List[str] = []
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            tbl_g = _exec_scalar(
+                cur, "select csSysTablesG from dbo.csSysTables with(nolock) where TableName = ?", t)
+            if tbl_g:
+                tbl_g = str(tbl_g).upper()
+                out.append(f"TABLE exists in csSysTables (G={tbl_g}).")
+            else:
+                tbl_g = _stable_guid(cur, f"table:{t}")
+                row = {
+                    "_opr": "I", "csSysTablesG": tbl_g, "TableName": t,
+                    "TrackChanges": 1 if track_changes else 0,
+                    "HardErrorChecking": 0, "DataScriptingLevel": 0,
+                    "IsManagedTable": 1 if is_managed else 0,
+                }
+                if description_pl:
+                    row["Description_PL"] = description_pl
+                if description_en:
+                    row["Description_EN"] = description_en
+                resp = _jsonsave(cur, "csSysTablesJSONSave", [row])
+                if resp:
+                    return f"csSysTablesJSONSave ERROR:\n{resp}"
+                out.append(f"TABLE registered (G={tbl_g}, managed={int(is_managed)}, "
+                           f"trackChanges={int(track_changes)}).")
+
+            existing_cols = {
+                r[0] for r in cur.execute(
+                    "select ColumnName from dbo.csSysColumns with(nolock) where csSysTablesG = ?",
+                    tbl_g).fetchall()
+            }
+            max_ord = int(_exec_scalar(
+                cur, "select isnull(max(ColumnOrder),0) from dbo.csSysColumns with(nolock) "
+                     "where csSysTablesG = ?", tbl_g) or 0)
+            new_rows = []
+            for c in cols:
+                if c["name"] in existing_cols:
+                    continue
+                max_ord += 1
+                row = {
+                    "_opr": "I",
+                    "csSysColumnsG": _stable_guid(cur, f"col:{t}:{c['name']}"),
+                    "csSysTablesG": tbl_g,
+                    "ColumnName": c["name"],
+                    "ColumnOrder": max_ord,
+                    "BaseType": c["type"],
+                    "IsNullable": 1 if c.get("nullable", True) else 0,
+                }
+                if c.get("params"):
+                    row["ColumnParams"] = c["params"]
+                if c.get("default"):
+                    row["DefaultDef"] = c["default"]
+                for lang in COLUMN_DESC_LANGS:
+                    row[f"ColumnDesc_{lang}"] = c["desc"][lang]
+                new_rows.append(row)
+            if new_rows:
+                resp = _jsonsave(cur, "csSysColumnsJSONSave", new_rows)
+                if resp:
+                    return f"csSysColumnsJSONSave ERROR:\n{resp}"
+                out.append(f"COLUMNS added: {len(new_rows)} "
+                           f"({', '.join(r['ColumnName'] for r in new_rows)}).")
+            else:
+                out.append("COLUMNS: nothing to add (all present).")
+
+            existing_idx = {
+                r[0] for r in cur.execute(
+                    "select IndexName from dbo.csSysIndexes with(nolock) where csSysTablesG = ?",
+                    tbl_g).fetchall()
+            }
+            idx_rows = []
+            for i, ix in enumerate(idxs, start=1):
+                nm = ix.get("name") or f"ix_{t}_{i:02d}"
+                if nm in existing_idx:
+                    continue
+                idx_rows.append({
+                    "_opr": "I",
+                    "csSysIndexesG": _stable_guid(cur, f"idx:{t}:{nm}"),
+                    "csSysTablesG": tbl_g,
+                    "IndexName": nm,
+                    "IsPK": 1 if ix.get("pk") else 0,
+                    "IsUQ": 1 if (ix.get("uq") or ix.get("pk")) else 0,
+                    "IsClustered": 1 if ix.get("clustered") else 0,
+                    "KeyFields": _norm_keys(ix.get("keys") or ""),
+                    "isActive": 1,
+                })
+            if idx_rows:
+                resp = _jsonsave(cur, "csSysIndexesJSONSave", idx_rows)
+                if resp:
+                    return f"csSysIndexesJSONSave ERROR:\n{resp}"
+                out.append(f"INDEXES added: {len(idx_rows)} "
+                           f"({', '.join(r['IndexName'] for r in idx_rows)}).")
+            else:
+                out.append("INDEXES: nothing to add (all present).")
+
+            cur.execute(
+                "declare @r xml; "
+                "exec dbo.csSysTablesRebuild @csSysTablesG = ?, @TableName = ?, @response = @r out; "
+                "select convert(nvarchar(max), @r) [response];",
+                tbl_g, t,
+            )
+            r = cur.fetchone()
+            resp = _xml_response_to_text(r[0] if r else None)
+            if resp:
+                return f"csSysTablesRebuild WARNING:\n{resp}\nDone so far:\n  " + "\n  ".join(out)
+
+            phys = _exec_scalar(cur, "select object_id(?)", f"dbo.{t}")
+            pk_cnt = _exec_scalar(
+                cur, "select count(*) from sys.indexes where object_id = object_id(?) "
+                     "and is_primary_key = 1", f"dbo.{t}")
+            jsave = _exec_scalar(cur, "select object_id(?)", f"dbo.{t}JSONSave")
+            out.append(f"REBUILD OK: physical={bool(phys)}, PK={int(pk_cnt or 0)}, "
+                       f"JSONSave={'present' if jsave else ('MISSING!' if is_managed else 'n/a (not managed)')}")
+
+    return f"OK: register_cs_table {t}\n  " + "\n  ".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 3c. register_job — csCompaniesJobs registration with project conventions
+# ---------------------------------------------------------------------------
+
+def register_job(
+    connection_string: str,
+    procedure_name: str,
+    cs_companies_id: int,
+    start_time: str,
+    interval_seconds: int,
+    job_desc_pl: str,
+    job_desc_en: Optional[str] = None,
+    thread_no: int = 8100,
+    job_order: Optional[int] = None,
+    active: bool = True,
+) -> str:
+    """
+    Register a job in csCompaniesJobs (idempotent by company+ProcedureName).
+    Conventions handled: 'dbo.' prefix on ProcedureName, stable G
+    (md5 'job:<company>:<proc>'), JobOrder = max+100 when omitted, wrapper-proc
+    existence check. start_time = 'YYYY-MM-DDTHH:MM:SS' (for weekly jobs pick the
+    correct weekday!); interval_seconds: 86400 = daily, 604800 = weekly.
+    """
+    pname = (procedure_name or "").strip()
+    if not pname:
+        return "Error: procedure_name is required."
+    if not pname.lower().startswith("dbo."):
+        pname = f"dbo.{pname}"
+    if not job_desc_pl:
+        return "Error: job_desc_pl is required."
+
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            proc_exists = _exec_scalar(cur, "select object_id(?)", pname)
+            existing = cur.execute(
+                "select csCompaniesJobsId, StartTime, Interval, Active from dbo.csCompaniesJobs with(nolock) "
+                "where csCompaniesId = ? and ProcedureName = ?",
+                int(cs_companies_id), pname,
+            ).fetchone()
+            if existing:
+                return (f"EXISTS: job {pname} already registered for company {cs_companies_id} "
+                        f"(Id={existing[0]}, StartTime={existing[1]}, Interval={existing[2]}, "
+                        f"Active={existing[3]}). Nothing changed.")
+
+            if job_order is None:
+                job_order = int(_exec_scalar(
+                    cur, "select isnull(max(JobOrder),0)+100 from dbo.csCompaniesJobs with(nolock) "
+                         "where csCompaniesId = ?", int(cs_companies_id)) or 100)
+
+            bare = pname[4:]
+            row = {
+                "_opr": "I",
+                "csCompaniesJobsG": _stable_guid(cur, f"job:{int(cs_companies_id)}:{bare}"),
+                "csCompaniesId": int(cs_companies_id),
+                "csAppNameSpacesG": DEFAULT_NAMESPACE_G,
+                "ProcedureName": pname,
+                "StartTime": start_time,
+                "Interval": int(interval_seconds),
+                "Active": 1 if active else 0,
+                "ThreadNo": int(thread_no),
+                "JobOrder": int(job_order),
+                "JobDesc_PL": job_desc_pl,
+            }
+            if job_desc_en:
+                row["JobDesc_EN"] = job_desc_en
+            resp = _jsonsave(cur, "csCompaniesJobsJSONSave", [row])
+            if resp:
+                return f"csCompaniesJobsJSONSave ERROR:\n{resp}"
+
+            jid = _exec_scalar(
+                cur, "select csCompaniesJobsId from dbo.csCompaniesJobs with(nolock) "
+                     "where csCompaniesId = ? and ProcedureName = ?",
+                int(cs_companies_id), pname)
+
+    warn = "" if proc_exists else f"\nWARNING: procedure {pname} does NOT exist on this server yet!"
+    return (f"OK: job {pname} registered (Id={jid}, company={cs_companies_id}, "
+            f"StartTime={start_time}, Interval={interval_seconds}s, ThreadNo={thread_no}, "
+            f"JobOrder={job_order}, Active={int(active)}).{warn}")
 
 
 # ---------------------------------------------------------------------------
@@ -1197,7 +1524,8 @@ def ng_upsert_cols_group(
 
 STMSQL_TEST_PARAMS_DECL = (
     "@stmSQLOut nvarchar(max) out, @ch nvarchar(2), @csCompaniesIdStr nvarchar(30), "
-    "@isRefreshOneRecord int, @LanguageSuffix nvarchar(2), @where nvarchar(max)"
+    "@isRefreshOneRecord int, @LanguageSuffix nvarchar(2), @where nvarchar(max), "
+    "@whereLists nvarchar(max)"
 )
 
 
@@ -1208,7 +1536,7 @@ def _test_stmsql(cur, stm: str, where_json: str) -> Optional[str]:
             "declare @stmSQLOut nvarchar(max) = N''; "
             "exec sp_executesql @stmt = ?, @params = N'" + STMSQL_TEST_PARAMS_DECL + "', "
             "@stmSQLOut = @stmSQLOut out, @ch = ?, @csCompaniesIdStr = N'1435126', "
-            "@isRefreshOneRecord = 0, @LanguageSuffix = N'PL', @where = ?; "
+            "@isRefreshOneRecord = 0, @LanguageSuffix = N'PL', @where = ?, @whereLists = N'{}'; "
             "select @stmSQLOut;",
             stm, "\r\n", where_json,
         )
@@ -2339,6 +2667,43 @@ def ng_add_filter(connection_string: str, app_window_ident: str, field_ident: st
                 log.append(f"  watermark ({', '.join(sorted(watermark))})")
 
     if is_lookup_host:
+        # LookupDefsSet validation rejects the whole batch when the target field
+        # (dataFieldIdentTo) does not exist yet — auto-create missing hidden host
+        # where-fields for every set target BEFORE wiring the lookup.
+        if lookup_sets:
+            with connect(connection_string, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    for st in lookup_sets:
+                        target = (st.get("to_field") or st.get("from_field") or "").strip()
+                        if not target or target == field_ident:
+                            continue
+                        if (st.get("source_kind_to") or "where") != "where":
+                            continue
+                        ex2 = _exec_scalar(
+                            cur,
+                            "select 1 from dbo.csNGAppWindowDataSetsWhereFields with(nolock) "
+                            "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and dataFieldIdent=?",
+                            namespace_g, app_window_ident, data_set_ident, target,
+                        )
+                        if ex2:
+                            continue
+                        is_id = target.lower().endswith("id")
+                        resp = _jsonsave(cur, "csNGAppWindowDataSetsWhereFieldsJSONSave", [{
+                            "_opr": "I",
+                            "csNGAppWindowDataSetsWhereFieldsG": _new_guid(),
+                            "csAppNameSpacesG": namespace_g,
+                            "appWindowIdent": app_window_ident,
+                            "dataSetIdent": data_set_ident,
+                            "dataFieldIdent": target,
+                            "formatType": "integer" if is_id else "string",
+                            "SQLBaseType": "bigint" if is_id else "nvarchar",
+                            **({} if is_id else {"SQLColumnParams": "(max)"}),
+                            "isActive": 1,
+                        }])
+                        if resp:
+                            return f"auto host where-field '{target}' JSONSave WARNING:\n{resp}"
+                        log.append(f"  AUTO where-field host '{target}' "
+                                   f"({'integer/bigint' if is_id else 'string/nvarchar(max)'}) — Set target")
         lk = ng_add_lookup(
             connection_string,
             app_window_ident=app_window_ident,
@@ -2797,30 +3162,112 @@ def ng_add_menu_entry(
     app_window_ident: str,
     dict_app_window: Optional[str] = None,
     parent_menu_path: Optional[str] = None,
+    parent_g: Optional[str] = None,
     labels: Optional[dict] = None,
     menu_path: Optional[str] = None,
     ord: Optional[int] = None,
+    kind: str = "NGDict",
+    icon: Optional[str] = None,
     usable: bool = True,
     rebuild: bool = False,
     cs_companies_id: Optional[int] = None,
     namespace_g: str = DEFAULT_NAMESPACE_G,
 ) -> str:
     """
-    Add the NG menu entry (Kind='NGDict') for a window, enforcing the project rule:
-    the Dict entry is NEVER replaced — both entries coexist.
+    Add an NG menu entry (Kind='NGDict') or a MENU NODE (kind='Menu'), enforcing the
+    project rule: the Dict entry is NEVER replaced — both entries coexist.
       - If the Dict predecessor has a menu entry (dict_app_window, default =
         app_window_ident): the NGDict entry is CLONED from it (same parent/Id/labels/
         ContentGuid/Icon, generator formula for menuPath slug from appWindowDesc_PL).
-      - Otherwise a fresh entry is created under parent_menu_path (menuPath of the
-        parent node, e.g. '/rozrachunki'); labels {PL,...} required (ContentGuid is
-        reused/created in csTranslate by content).
+      - Otherwise a fresh entry is created under the parent given by parent_menu_path
+        (menuPath, e.g. '/rozrachunki') OR parent_g (csAppMainMenusItemsG — works for
+        NODES that have no menuPath); labels {PL,...} required (ContentGuid is
+        reused/created in csTranslate by content — ContentGuid is REQUIRED also for nodes).
+      - kind='Menu' creates a grouping NODE (no window, no menuPath): parent_g/
+        parent_menu_path + labels required; app_window_ident is used only as a stable
+        ident for logs.
     Idempotent: existing NGDict entry -> reports it (and can flip usable).
     REMEMBER: menu changes need the user cache rebuild (rebuild=True + cs_companies_id).
     """
     aw = (app_window_ident or "").strip()
     if not aw:
         return "Error: app_window_ident is required."
+    if kind not in ("NGDict", "Menu"):
+        return "Error: kind must be 'NGDict' or 'Menu'."
     out: List[str] = []
+
+    def _fetch_parent(cur):
+        """Resolve parent by parent_g (works for nodes) or parent_menu_path."""
+        if parent_g:
+            cur.execute(
+                "select csAppMainMenusItemsG, csAppMainMenusG, menuPath "
+                "from dbo.csAppMainMenusItems with(nolock) where csAppMainMenusItemsG = ?",
+                str(parent_g),
+            )
+            p = cur.fetchone()
+            if not p:
+                return None, f"Error: parent menu item with G='{parent_g}' not found."
+            return p, None
+        if parent_menu_path:
+            cur.execute(
+                "select csAppMainMenusItemsG, csAppMainMenusG, menuPath "
+                "from dbo.csAppMainMenusItems with(nolock) where menuPath = ?",
+                parent_menu_path,
+            )
+            p = cur.fetchone()
+            if not p:
+                return None, f"Error: parent menu item with menuPath='{parent_menu_path}' not found."
+            return p, None
+        return None, "Error: pass parent_menu_path or parent_g."
+
+    if kind == "Menu":
+        if not labels or not labels.get("PL"):
+            return "Error: labels with at least PL are required for a Menu node."
+        with connect(connection_string, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                parent, perr = _fetch_parent(cur)
+                if perr:
+                    return perr
+                dup = _exec_scalar(
+                    cur,
+                    "select top 1 m.csAppMainMenusItemsId from dbo.csAppMainMenusItems m with(nolock) "
+                    "join dbo.csTranslate t with(nolock) on t.csTranslateG = m.ContentGuid "
+                    "where m.csAppMainMenusParentItemsG = ? and m.Kind = N'Menu' and t.Content_PL = ?",
+                    str(parent[0]), labels["PL"],
+                )
+                if dup:
+                    return f"EXISTS: Menu node '{labels['PL']}' already under this parent (Id={dup})."
+                try:
+                    content_g, tg_action = _ensure_translate(cur, labels)
+                except (ValueError, RuntimeError) as e:
+                    return f"Error (csTranslate): {e}"
+                max_id = _exec_scalar(
+                    cur,
+                    "select isnull(max(Id),0) from dbo.csAppMainMenusItems with(nolock) "
+                    "where csAppMainMenusG=? and csAppMainMenusParentItemsG=?",
+                    parent[1], parent[0],
+                )
+                row = {
+                    "_opr": "I", "csAppMainMenusItemsG": _new_guid(),
+                    "csAppMainMenusParentItemsG": str(parent[0]).upper(),
+                    "csAppMainMenusG": str(parent[1]).upper(),
+                    "Id": int(ord if ord is not None else int(max_id) + 100),
+                    "Kind": "Menu", "IsQuick": 0,
+                    "ContentGuid": content_g,
+                    "notShowInAppMenu": 0, "deprecated": 0, "usable": _as_int(usable),
+                }
+                if icon:
+                    row["Icon"] = icon
+                resp = _jsonsave(cur, "csAppMainMenusItemsJSONSave", [row])
+                if resp:
+                    return f"csAppMainMenusItemsJSONSave ERROR:\n{resp}"
+                out.append(f"MENU NODE added: '{labels['PL']}' Id={row['Id']} "
+                           f"G={row['csAppMainMenusItemsG']} (csTranslate {tg_action}).")
+        if rebuild:
+            out.append(rebuild_user_rights(connection_string, cs_companies_id=cs_companies_id))
+        else:
+            out.append("REMINDER: rebuild_user_rights (menu cache) or the node stays invisible.")
+        return "\n".join(out)
     with connect(connection_string, autocommit=True) as conn:
         with conn.cursor() as cur:
             wdesc = _exec_scalar(
@@ -2894,16 +3341,13 @@ def ng_add_menu_entry(
                     row[f"Content_{lang}"] = (labels or {}).get(lang) or d.get(f"Content_{lang}")
                 mode = f"cloned from Dict entry of '{dict_name}'"
             else:
-                # Case B: fresh entry under parent_menu_path
-                if not parent_menu_path:
+                # Case B: fresh entry under parent_menu_path / parent_g
+                if not parent_menu_path and not parent_g:
                     return (f"Error: no Dict menu entry found for '{dict_name}' — pass parent_menu_path "
-                            f"(menuPath of the parent node) and labels for a fresh entry.")
-                cur.execute(
-                    "select csAppMainMenusItemsG, csAppMainMenusG, menuPath from dbo.csAppMainMenusItems with(nolock) "
-                    "where menuPath = ?", parent_menu_path)
-                parent = cur.fetchone()
-                if not parent:
-                    return f"Error: parent menu item with menuPath='{parent_menu_path}' not found."
+                            f"(menuPath of the parent node) or parent_g, plus labels for a fresh entry.")
+                parent, perr = _fetch_parent(cur)
+                if perr:
+                    return perr
                 texts = dict(labels or {})
                 texts.setdefault("PL", wdesc or aw)
                 try:
@@ -3348,6 +3792,16 @@ def help_upsert_topic(
         if val is None:
             return {}
         if isinstance(val, str):
+            # Some MCP clients serialize dict params as JSON STRINGS — without this
+            # the raw '{"PL": ...}' text would land verbatim in Subject_PL/Content_PL.
+            stripped = val.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, dict):
+                        return {k: v for k, v in parsed.items() if k in allowed and v}
+                except (ValueError, TypeError):
+                    pass
             return {"PL": val}
         return {k: v for k, v in val.items() if k in allowed and v}
 
@@ -3672,6 +4126,8 @@ CS_TOOL_NAMES = {
     "deploy_sql_object",
     "cs_jsonsave",
     "add_cs_column",
+    "register_cs_table",
+    "register_job",
     "add_ng_field",
     "get_cs_object_versions",
     "update_view_html",
@@ -3712,12 +4168,15 @@ def tool_descriptors():
                 "Compact schema of a DB object: for a table/view -> columns "
                 "(name | type(len) NULL/NOT NULL [PK][identity][-> ref]); for a "
                 "procedure/function -> parameter list. Use INSTEAD of guessing "
-                "column names (avoids repeated 'Invalid column name')."
+                "column names (avoids repeated 'Invalid column name'). Works on any "
+                "environment via `server` (default DEV)."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "object_name": {"type": "string", "description": "Object name (dbo. prefix optional), e.g. 'csNGAppWindowDataSetsActionsFields'."},
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO"],
+                               "description": "Target environment (default DEV)."},
                 },
                 "required": ["object_name"],
             },
@@ -3736,6 +4195,8 @@ def tool_descriptors():
                     "pattern": {"type": "string", "description": "Literal substring to find (case-insensitive)."},
                     "name_like": {"type": "string", "description": "Optional: only objects whose name contains this."},
                     "top": {"type": "integer", "description": "Max hits (default 100)."},
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO"],
+                               "description": "Target environment (default DEV)."},
                 },
                 "required": ["pattern"],
             },
@@ -3841,7 +4302,9 @@ def tool_descriptors():
                 "Create a filter-panel where-field (+ optional lookup wiring + watermark) "
                 "in one call. Lookup hosts (string) default notUseForGetData=1. Provide "
                 "watermark {PL,EN,..} for :showLabel=false fields. lookup_window_ident + "
-                "lookup_sets wire ng_add_lookup with source_kind='where'."
+                "lookup_sets wire ng_add_lookup with source_kind='where'; missing hidden "
+                "host where-fields for Set targets (e.g. csWarehousesId list) are "
+                "AUTO-CREATED before the Set rows (validation requires target-first)."
             ),
             inputSchema={
                 "type": "object",
@@ -3872,7 +4335,11 @@ def tool_descriptors():
                 "Deploy a procedure/function/view/trigger through the cs* versioning "
                 "framework (csAddObjVer). Handles all pitfalls automatically: objectName "
                 "WITHOUT dbo. prefix, @pv=latest version, fresh unique @v, 3-batch split "
-                "(no GO), and orphan inProgress cleanup. `body` is the CREATE statement only."
+                "(no GO), and orphan inProgress cleanup. `body` is the CREATE statement only. "
+                "server=PROD deploys the SAME @v as the DEV latest version (consistent chain; "
+                "deploy on DEV first; idempotent when the version is already on the target). "
+                "NEVER patch managed objects with raw ALTER — registry divergence ships bugs "
+                "in upgrade packages."
             ),
             inputSchema={
                 "type": "object",
@@ -3881,8 +4348,69 @@ def tool_descriptors():
                     "body": {"type": "string", "description": "The CREATE statement only (CREATE procedure dbo.<Name> ... )."},
                     "description": {"type": "string", "description": "Version description (>=3 chars)."},
                     "object_type": {"type": "string", "description": "procedure|function|view|trigger (informational)."},
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO"],
+                               "description": "Target environment (default DEV). Non-DEV reuses the DEV latest @v."},
                 },
                 "required": ["object_name", "body", "description"],
+            },
+        ),
+        Tool(
+            name="register_cs_table",
+            description=(
+                "Register a cs* table END-TO-END: csSysTables + csSysColumns (full "
+                "12-language ColumnDesc enforced) + csSysIndexes + csSysTablesRebuild "
+                "(both params) + physical/JSONSave verification. Idempotent (skips existing, "
+                "adds missing). is_managed=true auto-adds <T>Id/<T>G columns and default "
+                "pk/uq indexes; non-managed tables require an explicit clustered PK. "
+                "Deterministic GUIDs (md5 'table:<T>'/'col:<T>:<c>'/'idx:<T>:<name>')."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_name": {"type": "string"},
+                    "columns": {
+                        "type": "array", "items": {"type": "object"},
+                        "description": ("[{name, type ('bigint'|'nvarchar'|'numeric'|...), params? ('(18,6)'), "
+                                        "nullable? (default true), default? ('((0))'), "
+                                        "desc: {EN,PL,DE,FR,ES,IT,NL,PT,RU,UK,SK,SE — all 12, real translations}}]"),
+                    },
+                    "indexes": {
+                        "type": "array", "items": {"type": "object"},
+                        "description": ("[{name?, keys: 'colA,colB' | ['colA','colB'] | '[colA] asc,...', "
+                                        "pk?, uq?, clustered?}]. Default for managed: pk(Id)+uq(G)."),
+                    },
+                    "description_pl": {"type": "string", "description": "csSysTables.Description_PL."},
+                    "description_en": {"type": "string", "description": "csSysTables.Description_EN."},
+                    "is_managed": {"type": "boolean", "description": "IsManagedTable (JSONSave generated). Default false (aggregate/work table — direct DML allowed)."},
+                    "track_changes": {"type": "boolean", "description": "TrackChanges audit. Default false."},
+                },
+                "required": ["table_name", "columns"],
+            },
+        ),
+        Tool(
+            name="register_job",
+            description=(
+                "Register a job in csCompaniesJobs (idempotent by company+ProcedureName). "
+                "Conventions handled: dbo. prefix, stable G, JobOrder=max+100 when omitted, "
+                "wrapper-proc existence check. interval_seconds: 86400=daily, 604800=weekly "
+                "(pick the right weekday in start_time!). Works cross-server via `server`."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "procedure_name": {"type": "string", "description": "Wrapper proc, e.g. 'csFooFillJob' (dbo. optional)."},
+                    "cs_companies_id": {"type": "integer"},
+                    "start_time": {"type": "string", "description": "'YYYY-MM-DDTHH:MM:SS' — first run; weekday matters for weekly jobs."},
+                    "interval_seconds": {"type": "integer", "description": "86400=daily, 604800=weekly."},
+                    "job_desc_pl": {"type": "string"},
+                    "job_desc_en": {"type": "string"},
+                    "thread_no": {"type": "integer", "description": "Default 8100 (planning thread)."},
+                    "job_order": {"type": "integer", "description": "Default max+100 for the company."},
+                    "active": {"type": "boolean", "description": "Default true."},
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO"],
+                               "description": "Target environment (default DEV)."},
+                },
+                "required": ["procedure_name", "cs_companies_id", "start_time", "interval_seconds", "job_desc_pl"],
             },
         ),
         Tool(
@@ -3969,6 +4497,8 @@ def tool_descriptors():
                 "properties": {
                     "object_name": {"type": "string"},
                     "top": {"type": "integer", "description": "Max rows (default 10)."},
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO"],
+                               "description": "Target environment (default DEV)."},
                 },
                 "required": ["object_name"],
             },
@@ -4091,9 +4621,12 @@ def tool_descriptors():
             description=(
                 "Replace a dataset stmSQL with a MANDATORY sp_executesql test BEFORE saving: "
                 "template runs twice (with dates — apostrophe bugs only show with non-null "
-                "dates — and with empty where). Saved only if both pass. Snapshot the old "
-                "stmSQL first via ng_get_window_config(include_stmsql=true). test=false only "
-                "for templates needing extra params (@csItemsIdStr...) — verify manually then."
+                "dates — and with empty where). Saved only if both pass. Harness provides "
+                "@where, @whereLists='{}', @isRefreshOneRecord, @csCompaniesIdStr, "
+                "@LanguageSuffix — templates using @whereLists (warehouse masks) test fine. "
+                "Snapshot the old stmSQL first via ng_get_window_config(include_stmsql=true). "
+                "test=false only for templates needing OTHER extra params (@csItemsIdStr...) — "
+                "verify manually then (e.g. ng_preview_dataset)."
             ),
             inputSchema={
                 "type": "object",
@@ -4142,6 +4675,8 @@ def tool_descriptors():
                     "cs_companies_id": {"type": "integer", "description": "Narrow to this company (recommended on DEV)."},
                     "cs_usr_id": {"type": "integer", "description": "Narrow to this user."},
                     "confirm_all": {"type": "boolean", "description": "Required for a full rebuild of ALL internal users."},
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO"],
+                               "description": "Target environment (default DEV)."},
                 },
             },
         ),
@@ -4272,21 +4807,25 @@ def tool_descriptors():
         Tool(
             name="ng_add_menu_entry",
             description=(
-                "Add the NGDict menu entry for an NG window WITHOUT touching the Dict entry (project "
-                "rule: both coexist). Clones the Dict predecessor's entry when it exists (labels/"
-                "ContentGuid/parent/Id; menuPath slug via generator formula), otherwise creates a "
-                "fresh entry under parent_menu_path with labels (csTranslate reuse/create). "
-                "Idempotent; reminds/performs the menu cache rebuild."
+                "Add an NGDict menu entry OR a grouping Menu NODE (kind='Menu') WITHOUT touching "
+                "the Dict entry (project rule: both coexist). Clones the Dict predecessor's entry "
+                "when it exists (labels/ContentGuid/parent/Id; menuPath slug via generator formula), "
+                "otherwise creates a fresh entry under parent_menu_path OR parent_g (works for nodes "
+                "without menuPath) with labels (csTranslate reuse/create — ContentGuid REQUIRED also "
+                "for nodes). Idempotent; reminds/performs the menu cache rebuild."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "app_window_ident": {"type": "string"},
+                    "app_window_ident": {"type": "string", "description": "NG window ident; for kind='Menu' only a log ident."},
                     "dict_app_window": {"type": "string", "description": "Dict predecessor name (default = app_window_ident)."},
                     "parent_menu_path": {"type": "string", "description": "menuPath of the parent node (fresh entries), e.g. '/rozrachunki'."},
-                    "labels": {"type": "object", "description": "{PL,EN,..} menu caption (fresh entries; overrides clone captions)."},
+                    "parent_g": {"type": "string", "description": "csAppMainMenusItemsG of the parent — use for parents WITHOUT menuPath (nodes)."},
+                    "labels": {"type": "object", "description": "{PL,EN,..} menu caption (fresh entries/nodes; overrides clone captions)."},
                     "menu_path": {"type": "string", "description": "Explicit menuPath (default: parentPath + slug)."},
-                    "ord": {"type": "integer", "description": "Menu Id/order (default: clone source or max+1)."},
+                    "ord": {"type": "integer", "description": "Menu Id/order (default: clone source or max+1; nodes: max+100)."},
+                    "kind": {"type": "string", "enum": ["NGDict", "Menu"], "description": "'Menu' creates a grouping NODE (no window, no menuPath)."},
+                    "icon": {"type": "string", "description": "Optional menu icon ident."},
                     "usable": {"type": "boolean", "description": "Default true."},
                     "rebuild": {"type": "boolean"},
                     "cs_companies_id": {"type": "integer", "description": "Scope for the rebuild."},
@@ -4422,6 +4961,34 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             body=arguments.get("body", ""),
             description=arguments.get("description", ""),
             object_type=arguments.get("object_type", "procedure"),
+            dev_connection_string=arguments.get("_dev_connection_string"),
+            target_label=arguments.get("_target_label") or "DEV",
+        )
+
+    if name == "register_cs_table":
+        return register_cs_table(
+            connection_string,
+            table_name=arguments.get("table_name", ""),
+            columns=arguments.get("columns") or [],
+            indexes=arguments.get("indexes"),
+            description_pl=arguments.get("description_pl"),
+            description_en=arguments.get("description_en"),
+            is_managed=bool(arguments.get("is_managed", False)),
+            track_changes=bool(arguments.get("track_changes", False)),
+        )
+
+    if name == "register_job":
+        return register_job(
+            connection_string,
+            procedure_name=arguments.get("procedure_name", ""),
+            cs_companies_id=int(arguments.get("cs_companies_id") or 0),
+            start_time=arguments.get("start_time", ""),
+            interval_seconds=int(arguments.get("interval_seconds") or 0),
+            job_desc_pl=arguments.get("job_desc_pl", ""),
+            job_desc_en=arguments.get("job_desc_en"),
+            thread_no=int(arguments.get("thread_no") or 8100),
+            job_order=int(arguments["job_order"]) if arguments.get("job_order") is not None else None,
+            active=bool(arguments.get("active", True)),
         )
 
     if name == "cs_jsonsave":
@@ -4709,9 +5276,12 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             app_window_ident=arguments.get("app_window_ident", ""),
             dict_app_window=arguments.get("dict_app_window"),
             parent_menu_path=arguments.get("parent_menu_path"),
+            parent_g=arguments.get("parent_g"),
             labels=arguments.get("labels"),
             menu_path=arguments.get("menu_path"),
             ord=arguments.get("ord"),
+            kind=arguments.get("kind") or "NGDict",
+            icon=arguments.get("icon"),
             usable=bool(arguments.get("usable", True)),
             rebuild=bool(arguments.get("rebuild", False)),
             cs_companies_id=arguments.get("cs_companies_id"),

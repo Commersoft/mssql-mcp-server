@@ -349,6 +349,40 @@ def find_write_token(sql: str) -> Optional[str]:
     return m.group(1).lower() if m else None
 
 
+# Guard: create/alter of a MANAGED cs* code object outside the csAddObjVer framework.
+# Searched on the RAW query (including string literals) — catches also the
+# sp_executesql/replace('create procedure','alter procedure') hotfix path that
+# caused the csPlanningPolicyProposalsCompute incident (registry carried the stale
+# body and the upgrade package shipped the bug to PROD).
+_MANAGED_DDL_RE = re.compile(
+    r"(?is)\b(create|alter)\s+(procedure|proc|function|view|trigger)\s+(\[?dbo\]?\.)?\[?cs\w+"
+)
+
+# cs tools that accept a `server` argument (resolved here, transparent for the tool).
+MULTI_SERVER_TOOLS = {
+    "describe", "sql_grep", "get_cs_object_versions", "rebuild_user_rights",
+    "register_job", "rag_get_sql_object", "deploy_sql_object",
+}
+
+
+def check_managed_ddl(query: str) -> Optional[str]:
+    """Return an error message when the query patches a managed cs* object outside
+    the versioning framework (no csAddObjVer in the same script)."""
+    if not _MANAGED_DDL_RE.search(query):
+        return None
+    low = query.lower()
+    if "csaddobjver" in low or "cssysdropobjectforcreate" in low:
+        return None
+    return (
+        "Error: query contains CREATE/ALTER of a managed cs* object WITHOUT csAddObjVer. "
+        "A raw ALTER leaves the STALE body in csSysObjVer and the next upgrade package "
+        "ships the bug (incydent csPlanningPolicyProposalsCompute 2026-07-16). "
+        "Use the deploy_sql_object tool (it handles @pv/@v/3-batch; server=PROD for "
+        "cross-env with a consistent chain). If this is intentional raw DDL "
+        "(e.g. a temp/unmanaged object), pass allow_raw_ddl=true."
+    )
+
+
 def resolve_profile_connection(profile_name: str) -> Tuple[str, str]:
     """Build (connection_string, label) for a named server profile.
     Raises ValueError with an actionable message when creds are missing."""
@@ -391,13 +425,13 @@ class SQLExecutor:
         self.connection_string = connection_string
         self.preprocessor = QueryPreprocessor()
     
-    def execute_query(self, query: str) -> Tuple[bool, List[str], Optional[str]]:
+    def execute_query(self, query: str, _retried: bool = False) -> Tuple[bool, List[str], Optional[str]]:
         """
         Execute a SQL query and return results.
-        
+
         Args:
             query: SQL query to execute
-            
+
         Returns:
             Tuple of (success, results, error_message)
         """
@@ -494,6 +528,11 @@ class SQLExecutor:
 
         except PyODBCError as e:
             error_msg = str(e)
+            # 2801 = "The definition of object ... has changed since it was compiled"
+            # — stale plan right after a redeploy; a single retry always fixes it.
+            if not _retried and "2801" in error_msg:
+                logger.warning("Error 2801 (definition changed since compiled) — retrying once.")
+                return self.execute_query(query, _retried=True)
             logger.error(f"Database error executing query: {error_msg}")
             return False, [], error_msg
         except Exception as e:
@@ -794,6 +833,15 @@ async def list_tools() -> List[Tool]:
                     "allow_write": {
                         "type": "boolean",
                         "description": "Required to run write statements (DML/exec/DDL) on a non-DEV profile. Ignored on TESTGRODNO (hard read-only)."
+                    },
+                    "allow_raw_ddl": {
+                        "type": "boolean",
+                        "description": (
+                            "Override for the managed-DDL guard: CREATE/ALTER of a cs* "
+                            "procedure/function/view/trigger without csAddObjVer is rejected "
+                            "(registry divergence ships bugs in upgrade packages) — prefer "
+                            "deploy_sql_object; pass true only for intentional raw DDL."
+                        )
                     }
                 },
                 "required": ["query"]
@@ -805,6 +853,28 @@ async def list_tools() -> List[Tool]:
     ]
 
 
+def _resolve_tool_connection(name: str, arguments: dict) -> Tuple[str, str]:
+    """Return (connection_string, header) for a cs/rag tool call honouring the
+    optional `server` argument (whitelisted tools only)."""
+    _, connection_string = DatabaseConfig.get_config()
+    header = ""
+    profile = (arguments.get("server") or "DEV").upper()
+    if profile != "DEV":
+        if name not in MULTI_SERVER_TOOLS:
+            raise ValueError(
+                f"Tool '{name}' does not support server='{profile}' — only: "
+                f"{', '.join(sorted(MULTI_SERVER_TOOLS))}."
+            )
+        target_conn, label = resolve_profile_connection(profile)
+        header = f"-- server: {profile} ({label}) --\n"
+        if name == "deploy_sql_object":
+            # cross-server deploy: target conn + DEV conn for the version chain
+            arguments["_dev_connection_string"] = connection_string
+            arguments["_target_label"] = profile
+        connection_string = target_conn
+    return connection_string, header
+
+
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> List[TextContent]:
     """Execute SQL commands."""
@@ -812,18 +882,18 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
 
     if name in rag_tools.RAG_TOOL_NAMES:
         try:
-            _, connection_string = DatabaseConfig.get_config()
+            connection_string, header = _resolve_tool_connection(name, arguments or {})
             text = rag_tools.handle_tool(name, arguments or {}, connection_string)
-            return [TextContent(type="text", text=text)]
+            return [TextContent(type="text", text=header + text)]
         except Exception as e:
             logger.error(f"Error in RAG tool {name}: {e}", exc_info=True)
             return [TextContent(type="text", text=f"Error: {e}")]
 
     if name in cs_tools.CS_TOOL_NAMES:
         try:
-            _, connection_string = DatabaseConfig.get_config()
+            connection_string, header = _resolve_tool_connection(name, arguments or {})
             text = cs_tools.handle_tool(name, arguments or {}, connection_string)
-            return [TextContent(type="text", text=text)]
+            return [TextContent(type="text", text=header + text)]
         except Exception as e:
             logger.error(f"Error in cs tool {name}: {e}", exc_info=True)
             return [TextContent(type="text", text=f"Error: {e}")]
@@ -845,6 +915,14 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
 
     profile_name = (arguments.get("server") or "DEV").upper()
     allow_write = bool(arguments.get("allow_write"))
+    allow_raw_ddl = bool(arguments.get("allow_raw_ddl"))
+
+    # Guard: managed cs* object patched outside the csAddObjVer framework
+    # (registry divergence -> upgrade package ships the stale body).
+    if not allow_raw_ddl:
+        ddl_err = check_managed_ddl(query)
+        if ddl_err:
+            return [TextContent(type="text", text=ddl_err)]
 
     # Log query info (truncated for security)
     query_preview = query[:100] + "..." if len(query) > 100 else query
