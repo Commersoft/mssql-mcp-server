@@ -383,6 +383,32 @@ def check_managed_ddl(query: str) -> Optional[str]:
     )
 
 
+def _reload_env_file() -> None:
+    """Re-read mssql-mcp-server/.env into os.environ (setdefault — existing values win).
+    Per-session credentials (e.g. CSSAVPOL_PWD) can be appended to .env while the
+    server is running; without this, only a process restart would pick them up."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(os.path.dirname(here), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+
+def _getenv_reloading(name: str) -> Optional[str]:
+    """os.getenv with a one-shot .env re-read fallback when the variable is missing."""
+    val = os.getenv(name)
+    if not val:
+        _reload_env_file()
+        val = os.getenv(name)
+    return val
+
+
 def resolve_profile_connection(profile_name: str) -> Tuple[str, str]:
     """Build (connection_string, label) for a named server profile.
     Raises ValueError with an actionable message when creds are missing."""
@@ -396,13 +422,13 @@ def resolve_profile_connection(profile_name: str) -> Tuple[str, str]:
     server = prof["server"] or dev_config["server"]
     database = prof["database"]
     if prof.get("user_env"):
-        user = os.getenv(prof["user_env"])
+        user = _getenv_reloading(prof["user_env"])
         if not user:
             raise ValueError(f"Profile {profile_name}: set env {prof['user_env']} (user).")
     else:
         user = prof["user"] or os.getenv("MSSQL_USER")
     if prof.get("password_env"):
-        password = os.getenv(prof["password_env"])
+        password = _getenv_reloading(prof["password_env"])
         if not password:
             raise ValueError(
                 f"Profile {profile_name}: missing env {prof['password_env']} (password). "
