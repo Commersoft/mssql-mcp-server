@@ -1,8 +1,11 @@
 """Pomocniczy runner SQL — ta sama ścieżka co execute_sql w mssql_simple_mcp.py.
 Użycie: python _run_sql.py <plik_z_sql>
 Czyta .env z katalogu serwera, łączy się przez pyodbc i wypisuje wynik.
+Plik może zawierać separatory GO (osobna linia) — batche wykonują się po kolei
+na jednym połączeniu, np. skrypt wdrożeniowy 3-batch z rag_get_sql_object.
 """
 import os
+import re
 import sys
 import pyodbc
 
@@ -36,25 +39,34 @@ def _connection_string() -> str:
     )
 
 
+def _print_result(cursor, batch_label=""):
+    prefix = f"[{batch_label}] " if batch_label else ""
+    if cursor.description:
+        cols = [d[0] for d in cursor.description]
+        rows = cursor.fetchall()
+        print(prefix + " | ".join(cols))
+        print("-" * max(len(" | ".join(cols)), 3))
+        for row in rows:
+            print(" | ".join("NULL" if v is None else str(v) for v in row))
+        print(f"\n{prefix}({len(rows)} rows)")
+    else:
+        rc = cursor.rowcount
+        print(f"{prefix}OK. Rows affected: {rc if rc >= 0 else 0}")
+
+
 def main():
     _load_env()
     with open(sys.argv[1], encoding="utf-8") as fh:
         query = fh.read()
+    # split na separatorach GO (case-insensitive, osobna linia) — pyodbc nie zna GO
+    batches = [b.strip() for b in re.split(r"(?im)^\s*GO\s*$", query) if b.strip()]
     with pyodbc.connect(_connection_string(), autocommit=True) as conn:
         with conn.cursor() as cursor:
             cursor.execute("while @@trancount > 0 rollback tran")
-            cursor.execute(query)
-            if cursor.description:
-                cols = [d[0] for d in cursor.description]
-                rows = cursor.fetchall()
-                print(" | ".join(cols))
-                print("-" * max(len(" | ".join(cols)), 3))
-                for row in rows:
-                    print(" | ".join("NULL" if v is None else str(v) for v in row))
-                print(f"\n({len(rows)} rows)")
-            else:
-                rc = cursor.rowcount
-                print(f"OK. Rows affected: {rc if rc >= 0 else 0}")
+            multi = len(batches) > 1
+            for i, batch in enumerate(batches, 1):
+                cursor.execute(batch)
+                _print_result(cursor, f"batch {i}/{len(batches)}" if multi else "")
 
 
 if __name__ == "__main__":
