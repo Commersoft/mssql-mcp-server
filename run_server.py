@@ -9,7 +9,8 @@ def _load_env():
     here = os.path.dirname(os.path.abspath(__file__))
     env_path = os.path.join(here, ".env")
     if os.path.exists(env_path):
-        with open(env_path, encoding="utf-8") as fh:
+        # utf-8-sig: .env bywa zapisany z BOM — zwykły utf-8 psuje pierwszy klucz (MSSQL_SERVER -> localhost)
+        with open(env_path, encoding="utf-8-sig") as fh:
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
