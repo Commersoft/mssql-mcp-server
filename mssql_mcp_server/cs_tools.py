@@ -61,6 +61,7 @@ returns @drop=1; orphan cleanup only flips inProgress=0 (never DELETE).
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import re
@@ -4254,12 +4255,18 @@ def _table_columns(cur, table: str) -> List[str]:
 
 def _json_value(value):
     """pyodbc value -> JSON-safe scalar for a JSONSave payload (openjson converts back).
-    bool BEFORE int (bool is an int subclass) — true/false in JSON breaks int columns."""
+    bool BEFORE int (bool is an int subclass) — true/false in JSON breaks int columns.
+    datetime: max milliseconds — str() emits 6-digit microseconds and SQL `datetime`
+    conversion fails on them ('Conversion failed when converting date and/or time')."""
     if isinstance(value, bool):
         return 1 if value else 0
     if value is None or isinstance(value, (str, int, float)):
         return value
-    return str(value)  # datetime / Decimal / UUID
+    if isinstance(value, datetime.datetime):
+        return value.isoformat(sep=" ", timespec="milliseconds")
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    return str(value)  # Decimal / UUID / bytes-repr
 
 
 def _fetch_dicts(cur, sql: str, *params) -> List[dict]:
