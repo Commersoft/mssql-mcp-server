@@ -362,7 +362,11 @@ _MANAGED_DDL_RE = re.compile(
 MULTI_SERVER_TOOLS = {
     "describe", "sql_grep", "get_cs_object_versions", "rebuild_user_rights",
     "register_job", "rag_get_sql_object", "deploy_sql_object",
+    "ng_replicate_window", "ng_ensure_privileges", "help_upsert_topic", "ng_preview_dataset",
 }
+
+# tools that additionally need the DEV connection (cross-server: DEV = source of truth)
+CROSS_SERVER_TOOLS = {"deploy_sql_object", "ng_replicate_window"}
 
 
 def check_managed_ddl(query: str) -> Optional[str]:
@@ -893,8 +897,8 @@ def _resolve_tool_connection(name: str, arguments: dict) -> Tuple[str, str]:
             )
         target_conn, label = resolve_profile_connection(profile)
         header = f"-- server: {profile} ({label}) --\n"
-        if name == "deploy_sql_object":
-            # cross-server deploy: target conn + DEV conn for the version chain
+        if name in CROSS_SERVER_TOOLS:
+            # cross-server: target conn + DEV conn (DEV = source of truth)
             arguments["_dev_connection_string"] = connection_string
             arguments["_target_label"] = profile
         connection_string = target_conn
