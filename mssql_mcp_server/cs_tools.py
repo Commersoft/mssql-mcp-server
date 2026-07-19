@@ -4231,7 +4231,6 @@ _REPLICATE_TABLES = (
     ("csNGAppWindowDataSetsLookupDefsGet", set()),
     ("csNGAppWindowDataSetsLookupDefsSet", set()),
     ("csNGAppWindowDataSetsLookupDefsSortIdents", set()),
-    ("csNGAppWindowDataSetsLinks", set()),
     ("csNGAppWindowDataSetsExports", set()),
     ("csNGAppWindowDataSetsImports", set()),
     ("csNGAppWindowColsGroups", set()),
@@ -4441,12 +4440,13 @@ def ng_replicate_window(
                    "csHelpContentsNGAppWindows": _pre_help}.get(table)
             replicate(table, exclude, window_where, (namespace_g, aw), pre)
 
-        # --- linked-window links in BOTH directions --------------------------
+        # --- From/To-scoped tables (linki okien + init where-fieldów z linków) ---
         links_where = ("(csAppNameSpacesGFrom=? and appWindowIdentFrom=?) "
                        "or (csAppNameSpacesGTo=? and appWindowIdentTo=?)")
         links_params = (namespace_g, aw, namespace_g, aw)
         replicate("csNGAppWindowsLinks", set(), links_where, links_params, _pre_link)
         replicate("csNGAppWindowsLinksFields", set(), links_where, links_params, _pre_link)
+        replicate("csNGAppWindowDataSetsLinks", set(), links_where, links_params, _pre_link)
 
         # master tab where-field (tabIdent-<placement>) — lives on the MASTER window,
         # required for multi-tab placements when replicating a DETAIL window
