@@ -5,6 +5,27 @@ import os
 import pyodbc
 from mcp.server.fastmcp import FastMCP
 
+
+def _load_env():
+    """Load credentials from local .env (per-developer, gitignored).
+
+    setdefault: explicit environment variables win over .env values.
+    utf-8-sig: .env bywa zapisany z BOM — zwykły utf-8 psuje pierwszy klucz.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(here, ".env")
+    if os.path.exists(env_path):
+        with open(env_path, encoding="utf-8-sig") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+
+_load_env()
+
 mcp = FastMCP("mssql")
 
 def _connection_string() -> str:
