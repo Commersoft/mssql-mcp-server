@@ -842,7 +842,7 @@ async def list_tools() -> List[Tool]:
         Tool(
             name="execute_sql",
             description=(
-                "Execute an SQL query. Default target = DEV (from .env). Optional `server` targets a named "
+                "Execute an SQL query (REQUIRED param: query — NOT 'sql'). Default target = DEV (from .env). Optional `server` targets a named "
                 "profile: PROD (cs-sql03/cs04 — Grodno), PLAY (csPlay), LOT (csLot), CSSQL01 (cs-sql01\\cs — czas pracy), "
                 "SAVPOL (CS-SQL02\\SAVPOL/cs06), TESTGRODNO (CS-BCKP01\\GRODNO/test04, ALWAYS read-only). "
                 "Non-DEV profiles are READ-ONLY by default: insert/update/delete/exec/DDL are rejected unless "

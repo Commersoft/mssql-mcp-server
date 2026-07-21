@@ -817,7 +817,8 @@ def tool_descriptors():
             description=(
                 "Return the full text of a SQL object via dbo.csSysScriptSqlObject "
                 "(fallback to sys.sql_modules). Use after rag_search_sql. Works on any "
-                "environment via `server` (default DEV) — handy to compare DEV vs PROD bodies."
+                "environment via `server` (default DEV) — handy to compare DEV vs PROD bodies. "
+                "REQUIRED param: object_name (snake_case — NOT 'name'/'query'/'objectName')."
             ),
             inputSchema={
                 "type": "object",
@@ -872,7 +873,8 @@ def tool_descriptors():
                 "bindings and lookup templates. part='html'/'xml': raw AppWindowViewHTML/AppWindowXML. "
                 "Use when matching an NG window to its full Dict counterpart "
                 "(header form fields, tabs, action bar) — NOT for single action forms "
-                "(use rag_get_dict_action_view_html)."
+                "(use rag_get_dict_action_view_html). "
+                "REQUIRED param: app_window (NOT 'app_window_ident')."
             ),
             inputSchema={
                 "type": "object",
@@ -896,7 +898,7 @@ def tool_descriptors():
         ),
         Tool(
             name="rag_get_file",
-            description="Return the content of a file under the workspace root (read-only).",
+            description="Return the content of a file under the workspace root (read-only). REQUIRED param: relpath (NOT 'path').",
             inputSchema={
                 "type": "object",
                 "properties": {

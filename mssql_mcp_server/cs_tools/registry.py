@@ -74,7 +74,8 @@ def tool_descriptors():
                 "(name | type(len) NULL/NOT NULL [PK][identity][-> ref]); for a "
                 "procedure/function -> parameter list. Use INSTEAD of guessing "
                 "column names (avoids repeated 'Invalid column name'). Works on any "
-                "environment via `server` (default DEV)."
+                "environment via `server` (default DEV). "
+                "REQUIRED param: object_name (snake_case — NOT 'object'/'name'/'query')."
             ),
             inputSchema={
                 "type": "object",
@@ -92,7 +93,8 @@ def tool_descriptors():
                 "Case-insensitive substring search over SQL object bodies "
                 "(sys.sql_modules). Returns object:line:content hits, like Grep over "
                 "files. Optional name_like narrows candidate objects. Use to locate "
-                "where a column/string is built instead of ad-hoc LIKE + substring."
+                "where a column/string is built instead of ad-hoc LIKE + substring. "
+                "REQUIRED param: pattern (NOT 'query'/'phrase')."
             ),
             inputSchema={
                 "type": "object",
@@ -440,7 +442,8 @@ def tool_descriptors():
                 "datasets, fields, layout cols, cols groups, actions, where fields, sort "
                 "idents, key fields, lookup defs, links. Use INSTEAD of ad-hoc SELECTs. "
                 "include_stmsql=true returns full stmSQL text (also useful as a snapshot "
-                "before ng_set_stmsql)."
+                "before ng_set_stmsql). "
+                "REQUIRED param: app_window_ident (snake_case — NOT 'appWindowIdent')."
             ),
             inputSchema={
                 "type": "object",
