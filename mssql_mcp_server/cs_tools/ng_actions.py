@@ -683,6 +683,10 @@ def ng_add_menu_entry(
                 cols = [d[0] for d in cur.description]
                 d = dict(zip(cols, dict_row))
                 new_path = menu_path or (d["parentPath"] + "/" + slug)
+                # childMenuPath MUSI być spójny z menuPath — łańcuch zapisu (csAppMainMenusItemsJSONSave)
+                # traktuje childMenuPath jako źródło prawdy i przelicza z niego menuPath; niespójność
+                # cofa jawny menu_path do kolizyjnego sluga (incydent paczek menu 2026-07-21/22)
+                child_slug = new_path.rsplit("/", 1)[-1] or slug
                 row = {
                     "_opr": "I", "csAppMainMenusItemsG": _new_guid(),
                     "csAppMainMenusParentItemsG": str(d["csAppMainMenusParentItemsG"]).upper()
@@ -694,7 +698,7 @@ def ng_add_menu_entry(
                     "StripColorBrush": d["StripColorBrush"],
                     "appWindowIdent": aw, "csAppNameSpacesG": namespace_g,
                     "ContentGuid": str(d["ContentGuid"]).upper(),
-                    "childMenuPath": slug, "menuPath": new_path,
+                    "childMenuPath": child_slug, "menuPath": new_path,
                     "notShowInAppMenu": _as_int(d["notShowInAppMenu"] or 0),
                     "commands": d["commands"], "params": d["params"],
                     "deprecated": 0, "usable": _as_int(usable),
@@ -731,7 +735,7 @@ def ng_add_menu_entry(
                     "csAppWindowsG": None, "Kind": "NGDict", "IsQuick": 0,
                     "appWindowIdent": aw, "csAppNameSpacesG": namespace_g,
                     "ContentGuid": content_g,
-                    "childMenuPath": slug,
+                    "childMenuPath": (menu_path.rsplit("/", 1)[-1] if menu_path else slug) or slug,
                     "menuPath": menu_path or (parent_path + "/" + slug),
                     "notShowInAppMenu": 0, "deprecated": 0, "usable": _as_int(usable),
                 }
