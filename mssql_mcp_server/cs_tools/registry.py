@@ -315,7 +315,7 @@ def tool_descriptors():
                     "interval_seconds": {"type": "integer", "description": "86400=daily, 604800=weekly."},
                     "job_desc_pl": {"type": "string"},
                     "job_desc_en": {"type": "string"},
-                    "thread_no": {"type": "integer", "description": "Default 8100 — UWAGA: wątek bez workera = job NIGDY nie ruszy (na DEV 8100 jest martwy!). Wybierz ŻYWY wątek: select ThreadNo, max(LastInvokeTime) from csCompaniesJobs group by ThreadNo (DEV: 200000 pipeline dev, 100000 nocne, 88 minutowe). Tool ostrzega gdy wątek wygląda martwo."},
+                    "thread_no": {"type": "integer", "description": "Default 8100. UWAGA: wątek bez workera = job NIGDY nie ruszy; wątki są SZEREGOWE — długie joby (LLM) trzymaj osobno od jobów o sztywnej porze. Sprawdź żywotność: select ThreadNo, max(LastInvokeTime) from csCompaniesJobs group by ThreadNo (DEV 2026-07-22: 200000 szybki pipeline, 8100 ciężkie AI, 100000 nocne, 88 minutowe). Tool ostrzega gdy wątek wygląda martwo."},
                     "job_order": {"type": "integer", "description": "Default max+100 for the company."},
                     "active": {"type": "boolean", "description": "Default true."},
                     "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO"],
