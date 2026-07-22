@@ -383,6 +383,18 @@ def register_job(
                 int(cs_companies_id), pname)
 
     warn = "" if proc_exists else f"\nWARNING: procedure {pname} does NOT exist on this server yet!"
+    # martwy wątek = job nigdy nie ruszy (incydent 2026-07-22: 6 jobów na ThreadNo=8100 z LastInvokeTime NULL)
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            thread_last = _exec_scalar(
+                cur, "select convert(nvarchar(19), max(LastInvokeTime), 120) from dbo.csCompaniesJobs with(nolock) "
+                     "where ThreadNo = ? and csCompaniesJobsId <> ?", int(thread_no), int(jid or 0))
+    if thread_last is None:
+        warn += (f"\nWARNING: ThreadNo={thread_no} wyglada na MARTWY (zaden job na tym watku nie ma "
+                 f"LastInvokeTime) — job moze nigdy nie ruszyc; sprawdz zywe watki: "
+                 f"select ThreadNo, max(LastInvokeTime) from csCompaniesJobs group by ThreadNo.")
+    else:
+        warn += f"\nINFO: ostatnia aktywnosc watku {thread_no}: {thread_last}."
     return (f"OK: job {pname} registered (Id={jid}, company={cs_companies_id}, "
             f"StartTime={start_time}, Interval={interval_seconds}s, ThreadNo={thread_no}, "
             f"JobOrder={job_order}, Active={int(active)}).{warn}")
