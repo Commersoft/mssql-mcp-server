@@ -9,7 +9,7 @@ import uuid
 from typing import List, Optional, Sequence
 from pyodbc import connect
 
-from ._core import DEFAULT_NAMESPACE_G, NG_COLSGROUP_LANGS, _exec_scalar, _jsonsave, _new_guid
+from ._core import DEFAULT_NAMESPACE_G, NG_COLSGROUP_LANGS, _exec_scalar, _jsonsave, _new_guid, _stable_guid
 
 
 # ---------------------------------------------------------------------------
@@ -269,8 +269,14 @@ def help_upsert_topic(
                 if dup:
                     out.append(f"  LINK exists: {w}")
                     continue
+                # HARD RULE 24: link G MUSI być identyczne na DEV i PROD (pakiety replikują
+                # po G; losowy newid() per środowisko = PK violation przy upgrade — incydent
+                # csHelpContentsNGAppWindowsReplicateRow 2026-07-22). Deterministyczne md5
+                # z klucza naturalnego → oba środowiska liczą to samo G.
+                link_g = _stable_guid(
+                    cur, f"helplink:{str(row_g).upper()}:{str(namespace_g).upper()}:{w}")
                 resp = _jsonsave(cur, "csHelpContentsNGAppWindowsJSONSave", [{
-                    "_opr": "I", "csHelpContentsNGAppWindowsG": _new_guid(),
+                    "_opr": "I", "csHelpContentsNGAppWindowsG": link_g,
                     "csHelpContentsG": row_g, "csAppNameSpacesG": namespace_g,
                     "appWindowIdent": w,
                 }])
