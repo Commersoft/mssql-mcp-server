@@ -250,7 +250,8 @@ class DatabaseConfig:
 # ---------------------------------------------------------------------------
 # Server profiles — named environments reachable from execute_sql(server=...).
 # DEV is the .env default. Non-DEV profiles are READ-ONLY unless allow_write=true
-# (TESTGRODNO is always read-only). Passwords come from env (.env), never inline.
+# (TESTGRODNO writes unlocked 2026-07-16 — decyzja jmk, kopia PROD do testów).
+# Passwords come from env (.env), never inline.
 # ---------------------------------------------------------------------------
 
 SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
@@ -844,7 +845,7 @@ async def list_tools() -> List[Tool]:
             description=(
                 "Execute an SQL query (REQUIRED param: query — NOT 'sql'). Default target = DEV (from .env). Optional `server` targets a named "
                 "profile: PROD (cs-sql03/cs04 — Grodno), PLAY (csPlay), LOT (csLot), CSSQL01 (cs-sql01\\cs — czas pracy), "
-                "SAVPOL (CS-SQL02\\SAVPOL/cs06), TESTGRODNO (CS-BCKP01\\GRODNO/test04, ALWAYS read-only). "
+                "SAVPOL (CS-SQL02\\SAVPOL/cs06), TESTGRODNO (CS-BCKP01\\GRODNO/test04 — kopia PROD do testów). "
                 "Non-DEV profiles are READ-ONLY by default: insert/update/delete/exec/DDL are rejected unless "
                 "allow_write=true. Schema changes on PROD are forbidden regardless (use csSysChanges packages)."
             ),
@@ -862,7 +863,7 @@ async def list_tools() -> List[Tool]:
                     },
                     "allow_write": {
                         "type": "boolean",
-                        "description": "Required to run write statements (DML/exec/DDL) on a non-DEV profile. Ignored on TESTGRODNO (hard read-only)."
+                        "description": "Required to run write statements (DML/exec/DDL) on a non-DEV profile (also on TESTGRODNO — writes unlocked 2026-07-16)."
                     },
                     "allow_raw_ddl": {
                         "type": "boolean",
