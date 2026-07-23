@@ -449,12 +449,68 @@ def resolve_profile_connection(profile_name: str) -> Tuple[str, str]:
     return conn, f"{server}/{database}"
 
 
+# Tabele referowane w zapytaniu — do auto-hinta po "Invalid column name".
+_INVALID_COL_TABLE_RE = re.compile(
+    r"(?:\bfrom\b|\bjoin\b|\bupdate\b|\binto\b)\s+(?:\[?dbo\]?\.)?\[?([A-Za-z_][A-Za-z0-9_]*)\]?",
+    re.IGNORECASE,
+)
+_INVALID_COL_SKIP = {"openjson", "string_split", "values", "select", "sys"}
+
+
 class SQLExecutor:
     """Handles SQL query execution"""
 
     def __init__(self, connection_string: str):
         self.connection_string = connection_string
         self.preprocessor = QueryPreprocessor()
+
+    def _enrich_invalid_column_error(self, query: str, error_msg: str) -> str:
+        """Po 'Invalid column name' doklej realne kolumny tabel z zapytania.
+
+        Oszczędza rundę describe/ponownego zgadywania: agent dostaje listę kolumn
+        w tej samej odpowiedzi, w której dostał błąd. Best-effort — każdy problem
+        z metadanymi zwraca oryginalny błąd bez zmian.
+        """
+        if "Invalid column name" not in error_msg:
+            return error_msg
+        names: List[str] = []
+        seen = set()
+        for m in _INVALID_COL_TABLE_RE.finditer(query):
+            t = m.group(1)
+            tl = t.lower()
+            if tl in seen or tl in _INVALID_COL_SKIP:
+                continue
+            seen.add(tl)
+            names.append(t)
+            if len(names) >= 5:
+                break
+        if not names:
+            return error_msg
+        lines: List[str] = []
+        try:
+            with connect(self.connection_string) as conn:
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    for t in names:
+                        cur.execute(
+                            "select name from sys.columns "
+                            "where object_id = object_id(N'dbo.' + ?) order by column_id",
+                            t,
+                        )
+                        cols = [r[0] for r in cur.fetchall()]
+                        if not cols:
+                            continue
+                        shown = ", ".join(cols[:80]) + (", ..." if len(cols) > 80 else "")
+                        lines.append(f"--   dbo.{t}: {shown}")
+        except Exception:
+            return error_msg
+        if not lines:
+            return error_msg
+        return (
+            error_msg
+            + "\n-- auto-hint (Invalid column name) — realne kolumny tabel z zapytania: --\n"
+            + "\n".join(lines)
+        )
     
     def execute_query(self, query: str, _retried: bool = False) -> Tuple[bool, List[str], Optional[str]]:
         """
@@ -565,7 +621,7 @@ class SQLExecutor:
                 logger.warning("Error 2801 (definition changed since compiled) — retrying once.")
                 return self.execute_query(query, _retried=True)
             logger.error(f"Database error executing query: {error_msg}")
-            return False, [], error_msg
+            return False, [], self._enrich_invalid_column_error(query, error_msg)
         except Exception as e:
             error_msg = f"Unexpected error: {str(e)}"
             logger.error(error_msg, exc_info=True)

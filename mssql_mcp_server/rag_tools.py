@@ -474,6 +474,12 @@ def get_dict_action_view_html(
 _TAG_RE = re.compile(r"<(/?)(?:div|li|ul)\b([^>]*?)(/?)>", re.IGNORECASE)
 _ATTR_RE = re.compile(r"""([A-Za-z-]+)=(?:"([^"]*)"|(\{[^}]*\}))""")
 _GUID_ATTRS = ("LabelGuid", "CaptionGuid", "HeaderGuid", "WatermarkGuid", "TextGuid", "ToolTipGuid")
+# Dict HTML zawiera literówki w GUID-ach (np. szablonowy data-ToolTipGuid="7feb91d-..." — 7 znaków
+# w pierwszym członie); taki string jako parametr porównany z uniqueidentifier wysadza CAŁE zapytanie
+# ("Conversion failed..."). Filtrujemy format po stronie Pythona — uszkodzone GUID-y zostają nierozwiązane.
+_GUID_FORMAT_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 _CONTROL_CLASSES = (
     "csDBEditEx", "csDBEdit", "csDBCheckBox", "csDBDateTimePicker", "csDBComboBox",
     "csDBRadioGroup", "csDBTextBlock", "csButtonAction", "csDictPanel", "csPdfViewer",
@@ -492,7 +498,7 @@ def _parse_attrs(attr_text: str) -> dict:
 def _resolve_guids(cur, guids: set) -> dict:
     """csTranslateG -> Content_PL for label/caption guids (chunked IN query)."""
     result = {}
-    guid_list = [g for g in guids if g]
+    guid_list = [g for g in guids if g and _GUID_FORMAT_RE.match(g)]
     for i in range(0, len(guid_list), 200):
         chunk = guid_list[i:i + 200]
         placeholders = ",".join("?" for _ in chunk)
