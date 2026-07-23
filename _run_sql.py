@@ -41,17 +41,25 @@ def _connection_string() -> str:
 
 def _print_result(cursor, batch_label=""):
     prefix = f"[{batch_label}] " if batch_label else ""
-    if cursor.description:
-        cols = [d[0] for d in cursor.description]
-        rows = cursor.fetchall()
-        print(prefix + " | ".join(cols))
-        print("-" * max(len(" | ".join(cols)), 3))
-        for row in rows:
-            print(" | ".join("NULL" if v is None else str(v) for v in row))
-        print(f"\n{prefix}({len(rows)} rows)")
-    else:
-        rc = cursor.rowcount
-        print(f"{prefix}OK. Rows affected: {rc if rc >= 0 else 0}")
+    # batch może zwrócić wiele zestawów wyników — bez pętli nextset() ginęły
+    # kolejne SELECT-y ORAZ błędy rzucane przez dalsze instrukcje batcha
+    set_no = 0
+    while True:
+        set_no += 1
+        tag = prefix if set_no == 1 else f"{prefix}[set {set_no}] "
+        if cursor.description:
+            cols = [d[0] for d in cursor.description]
+            rows = cursor.fetchall()
+            print(tag + " | ".join(cols))
+            print("-" * max(len(" | ".join(cols)), 3))
+            for row in rows:
+                print(" | ".join("NULL" if v is None else str(v) for v in row))
+            print(f"\n{tag}({len(rows)} rows)")
+        else:
+            rc = cursor.rowcount
+            print(f"{tag}OK. Rows affected: {rc if rc >= 0 else 0}")
+        if not cursor.nextset():
+            break
 
 
 def main():
