@@ -261,13 +261,21 @@ def ng_add_linked_window(connection_string: str, app_window_ident_from: str,
                          app_window_ident_to: str, placement: str,
                          map_fields: Sequence[dict], ord: int = 1,
                          labels: Optional[dict] = None, tab_default: Optional[str] = None,
+                         wire_one_item_only: bool = True,
                          namespace_g: str = DEFAULT_NAMESPACE_G) -> str:
     """Link a detail window to a master (csNGAppWindowsLinks + LinksFields). map_fields:
     [{from, to?}] (from = master main field, to = detail where-field; default to=from).
-    placement: 'bottom-panel'|'outer-side-panel'|'side-panel'|'inner-side-panel'.
+    placement: 'bottom-panel'|'outer-side-panel'|'side-panel'|'inner-side-panel'
+    (STANDARD dla detali = outer-side-panel).
     Optional tab_default sets the master where-field 'tabIdent-<placement>' (needed when a
     placement holds several tabs). labels: {'PL':..,'EN':..} for the tab caption. The
-    linkedWindows cache rebuilds automatically via csNGAppWindowsLinksJSONSave."""
+    linkedWindows cache rebuilds automatically via csNGAppWindowsLinksJSONSave.
+    wire_one_item_only (default True) dopina kontrakt oneItemOnly automatycznie:
+    where-field 'oneItemOnly' na detalu (tworzy gdy brak), stala LinksFields
+    oneItemOnly=1 (sourceKindFrom='value'), linkedParamName + initNewRow=1 na
+    mapowanych where-fieldach FK (bez linkedParamName panel NIGDY nie wysyla getData —
+    'invalid field link ... no query param'). Ochrone w stmSQL detalu (oneItemOnly=1 +
+    FK null => 0 wierszy) MUSISZ dodac sam — tool tylko ostrzega, gdy jej nie widzi."""
     if not map_fields:
         return "Error: map_fields is required (at least the master key mapping)."
     labels = labels or {}
@@ -330,6 +338,114 @@ def ng_add_linked_window(connection_string: str, app_window_ident_from: str,
                 if resp:
                     return f"csNGAppWindowsLinksFieldsJSONSave WARNING (map {ff}):\n{resp}"
                 log.append(f"  MAP {ff} -> {ft}")
+
+            # --- kontrakt oneItemOnly (patrz oneItemOnly-stmSQL-pattern.instructions.md) ---
+            if wire_one_item_only:
+                # 1) linkedParamName + initNewRow=1 na mapowanych where-fieldach FK detalu
+                #    (bez linkedParamName frontend: 'destination field has no query param'
+                #     i panel nigdy nie wysyla getData; initNewRow=1 = nowy wiersz w detalu
+                #     dziedziczy FK mastera)
+                for m in map_fields:
+                    if (m.get("source_kind_from") or "rows") != "rows":
+                        continue
+                    ft = m.get("to") or m.get("from")
+                    ds_to = m.get("data_set_ident_to") or "main"
+                    cur.execute(
+                        "select csNGAppWindowDataSetsWhereFieldsId, csNGAppWindowDataSetsWhereFieldsG, "
+                        "  linkedParamName, initNewRow "
+                        "from dbo.csNGAppWindowDataSetsWhereFields with(nolock) "
+                        "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and dataFieldIdent=?",
+                        namespace_g, app_window_ident_to, ds_to, ft,
+                    )
+                    wf = cur.fetchone()
+                    if not wf:
+                        log.append(f"  WARNING: detail where-field '{ft}' NOT FOUND — create it "
+                                   f"(ng_add_filter) and re-run, panel will not filter without it.")
+                        continue
+                    if (wf[2] or "") != ft or not wf[3]:
+                        resp = _jsonsave(cur, "csNGAppWindowDataSetsWhereFieldsJSONSave", [{
+                            "_opr": "U",
+                            "csNGAppWindowDataSetsWhereFieldsId": int(wf[0]),
+                            "csNGAppWindowDataSetsWhereFieldsG": str(wf[1]).upper(),
+                            "linkedParamName": ft,
+                            "initNewRow": 1,
+                        }])
+                        if resp:
+                            return f"whereField linkedParamName WARNING ({ft}):\n{resp}"
+                        log.append(f"  FK where-field {ft}: linkedParamName='{ft}', initNewRow=1 (U)")
+
+                # 2) where-field oneItemOnly na detalu (tworzy gdy brak)
+                exo = cur.execute(
+                    "select csNGAppWindowDataSetsWhereFieldsId, csNGAppWindowDataSetsWhereFieldsG, linkedParamName "
+                    "from dbo.csNGAppWindowDataSetsWhereFields with(nolock) "
+                    "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=N'main' and dataFieldIdent=N'oneItemOnly'",
+                    namespace_g, app_window_ident_to,
+                ).fetchone()
+                if not exo:
+                    resp = _jsonsave(cur, "csNGAppWindowDataSetsWhereFieldsJSONSave", [{
+                        "_opr": "I",
+                        "csNGAppWindowDataSetsWhereFieldsG": _new_guid(),
+                        "csAppNameSpacesG": namespace_g,
+                        "appWindowIdent": app_window_ident_to,
+                        "dataSetIdent": "main",
+                        "dataFieldIdent": "oneItemOnly",
+                        "formatType": "integer",
+                        "SQLBaseType": "tinyint",
+                        "dataFieldValueDef": "0",
+                        "linkedParamName": "oneItemOnly",
+                        "initNewRow": 0,
+                    }])
+                    if resp:
+                        return f"oneItemOnly whereField WARNING:\n{resp}"
+                    log.append("  where-field oneItemOnly (I)")
+                elif (exo[2] or "") != "oneItemOnly":
+                    resp = _jsonsave(cur, "csNGAppWindowDataSetsWhereFieldsJSONSave", [{
+                        "_opr": "U",
+                        "csNGAppWindowDataSetsWhereFieldsId": int(exo[0]),
+                        "csNGAppWindowDataSetsWhereFieldsG": str(exo[1]).upper(),
+                        "linkedParamName": "oneItemOnly",
+                    }])
+                    if resp:
+                        return f"oneItemOnly linkedParamName WARNING:\n{resp}"
+                    log.append("  where-field oneItemOnly: linkedParamName fixed (U)")
+
+                # 3) stala LinksFields oneItemOnly=1
+                exc = _exec_scalar(
+                    cur,
+                    "select count(*) from dbo.csNGAppWindowsLinksFields with(nolock) "
+                    "where csAppNameSpacesGFrom=? and appWindowIdentFrom=? and csAppNameSpacesGTo=? "
+                    "and appWindowIdentTo=? and dataSetIdentTo=N'main' and dataFieldIdentTo=N'oneItemOnly'",
+                    namespace_g, app_window_ident_from, namespace_g, app_window_ident_to,
+                )
+                if not exc:
+                    resp = _jsonsave(cur, "csNGAppWindowsLinksFieldsJSONSave", [{
+                        "_opr": "I",
+                        "csNGAppWindowsLinksFieldsG": _new_guid(),
+                        "csAppNameSpacesGFrom": namespace_g,
+                        "appWindowIdentFrom": app_window_ident_from,
+                        "csAppNameSpacesGTo": namespace_g,
+                        "appWindowIdentTo": app_window_ident_to,
+                        "sourceKindFrom": "value",
+                        "dataFieldValueFrom": "1",
+                        "dataSetIdentTo": "main",
+                        "dataFieldIdentTo": "oneItemOnly",
+                    }])
+                    if resp:
+                        return f"oneItemOnly LinksFields WARNING:\n{resp}"
+                    log.append("  LINK CONST oneItemOnly=1 (I)")
+
+                # 4) ochrona w stmSQL — tylko ostrzezenie, nie auto-fix
+                stm_reads = _exec_scalar(
+                    cur,
+                    "select count(*) from dbo.csNGAppWindowDataSets with(nolock) "
+                    "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=N'main' "
+                    "and cast(stmSQL as nvarchar(max)) like N'%oneItemOnly%'",
+                    namespace_g, app_window_ident_to,
+                )
+                if not stm_reads:
+                    log.append("  WARNING: detail stmSQL does NOT read oneItemOnly — add the guard "
+                               "(oneItemOnly=1 + master FK null => '= null' => 0 rows), see "
+                               "oneItemOnly-stmSQL-pattern.instructions.md.")
 
             if tab_default:
                 tab_field = f"tabIdent-{placement}"

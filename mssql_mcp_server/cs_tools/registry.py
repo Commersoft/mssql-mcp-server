@@ -187,10 +187,15 @@ def tool_descriptors():
             description=(
                 "Link a detail window to a master (csNGAppWindowsLinks + LinksFields) in "
                 "one call. map_fields: [{from, to?}] (master main field -> detail where-field). "
-                "placement: bottom-panel|outer-side-panel|side-panel|inner-side-panel. "
-                "Optional tab_default sets master where-field 'tabIdent-<placement>' (multi-tab "
-                "placements). labels {PL,EN,..} = tab caption. linkedWindows cache rebuilds "
-                "automatically."
+                "placement: bottom-panel|outer-side-panel|side-panel|inner-side-panel — STANDARD "
+                "for details = outer-side-panel. Optional tab_default sets master where-field "
+                "'tabIdent-<placement>' (multi-tab placements). labels {PL,EN,..} = tab caption. "
+                "linkedWindows cache rebuilds automatically. Wires the oneItemOnly contract by "
+                "default (wire_one_item_only): detail where-field 'oneItemOnly' (created if "
+                "missing), LinksFields constant oneItemOnly=1, linkedParamName + initNewRow=1 on "
+                "mapped FK where-fields (without linkedParamName the panel NEVER sends getData). "
+                "The stmSQL guard (oneItemOnly=1 + FK null => 0 rows) is YOURS to add — the tool "
+                "only warns when missing."
             ),
             inputSchema={
                 "type": "object",
@@ -202,6 +207,7 @@ def tool_descriptors():
                     "ord": {"type": "integer", "description": "Tab order (default 1)."},
                     "labels": {"type": "object", "description": "{PL,EN,DE,..} tab caption."},
                     "tab_default": {"type": "string", "description": "appWindowIdentTo of the default tab (for multi-tab placement)."},
+                    "wire_one_item_only": {"type": "boolean", "description": "Default true: auto-wire the oneItemOnly contract (where-field, link constant, linkedParamName+initNewRow on FK)."},
                     "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
                 },
                 "required": ["app_window_ident_from", "app_window_ident_to", "placement", "map_fields"],
@@ -655,9 +661,12 @@ def tool_descriptors():
             description=(
                 "Register/update an NG dataset action with conventions handled: crud='ins'|'upd'|'del' "
                 "presets the standard auto-action flags; custom action gets isAuto=0/ord=max+1/"
-                "position='default'. labels {PL,EN,..} -> actionDesc_*. fields -> ActionsFields. "
-                "Wires granular ActionsPrivileges automatically. Reminds/performs the rights-cache "
-                "rebuild (button invisible without it)."
+                "position='default' — TOOLBAR BUTTON requires is_auto=true (c-action-toolbar renders "
+                "isAuto=1 only; leave 0 for programmatic actions like onCF/form-invoked). "
+                "labels {PL,EN,..} -> actionDesc_*. fields -> ActionsFields. Wires granular "
+                "ActionsPrivileges only into EDITING privileges (already granting ins/upd/del); "
+                "view-only privileges are skipped with a warning (privilege-escalation guard). "
+                "Reminds/performs the rights-cache rebuild (button invisible without it)."
             ),
             inputSchema={
                 "type": "object",

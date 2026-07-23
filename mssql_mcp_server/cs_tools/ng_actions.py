@@ -245,18 +245,25 @@ def ng_add_action(
                     return f"ActionsFieldsJSONSave ERROR ({fi}):\n{resp}"
                 out.append(f"  field {fi}: {'U' if fg else 'I'}")
 
-            # --- privileges wiring (granular privileges only) ---
+            # --- privileges wiring (granular EDITING privileges only) ---
+            # Grant tylko do przywilejow granularnych, ktore JUZ maja ktorys z ins/upd/del —
+            # przywileje "tylko podglad" (0 grantow akcji lub sam 'show') pomijamy z ostrzezeniem.
+            # Bez tego nowa akcja wykonawcza laduje u userow podgladowych = eskalacja uprawnien
+            # (klasa incydentu fix_gaps / ng-window-jsonsave-pitfalls par.34).
             if wire_privileges:
                 cur.execute(
-                    "select p.csPrivilegesG, p.hasRightsAllDataSets from dbo.csNGAppWindowsPrivileges p with(nolock) "
+                    "select p.csPrivilegesG, p.hasRightsAllDataSets, isnull(pr.PrivilegeDesc_PL, N'') "
+                    "from dbo.csNGAppWindowsPrivileges p with(nolock) "
+                    "  left join dbo.csPrivileges pr with(nolock) on pr.csPrivilegesG = p.csPrivilegesG "
                     "where p.csAppNameSpacesG=? and p.appWindowIdent=?",
                     namespace_g, aw,
                 )
                 privs = cur.fetchall()
                 wired = 0
-                for pg, all_ds in privs:
+                skipped_view_only: List[str] = []
+                for pg, all_ds, priv_desc in privs:
                     if all_ds:
-                        continue
+                        continue  # hasRightsAllDataSets=1 pokrywa akcje bez grantu granularnego
                     dsp = cur.execute(
                         "select hasRightsAllActions from dbo.csNGAppWindowsDataSetsPrivileges with(nolock) "
                         "where csPrivilegesG=? and csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=?",
@@ -264,13 +271,16 @@ def ng_add_action(
                     ).fetchone()
                     if not dsp or dsp[0]:
                         continue
-                    exists_ap = _exec_scalar(
-                        cur,
-                        "select count(*) from dbo.csNGAppWindowsDataSetsActionsPrivileges with(nolock) "
-                        "where csPrivilegesG=? and csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and actionIdent=?",
-                        pg, namespace_g, aw, data_set_ident, act,
+                    cur.execute(
+                        "select actionIdent from dbo.csNGAppWindowsDataSetsActionsPrivileges with(nolock) "
+                        "where csPrivilegesG=? and csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=?",
+                        pg, namespace_g, aw, data_set_ident,
                     )
-                    if exists_ap:
+                    granted = {str(r[0]) for r in cur.fetchall()}
+                    if act in granted:
+                        continue
+                    if not granted & {"ins", "upd", "del"}:
+                        skipped_view_only.append(priv_desc or str(pg))
                         continue
                     resp = _jsonsave(cur, "csNGAppWindowsDataSetsActionsPrivilegesJSONSave", [{
                         "_opr": "I",
@@ -286,6 +296,10 @@ def ng_add_action(
                     wired += 1
                 out.append(f"  privileges: {wired} granular grant(s) added"
                            + ("" if privs else " (window has NO privileges — run ng_ensure_privileges!)"))
+                if skipped_view_only:
+                    out.append("  SKIPPED view-only privilege(s) (no ins/upd/del grants): "
+                               + ", ".join(skipped_view_only)
+                               + " — add the grant manually ONLY if the action is intentionally view-safe.")
 
     if rebuild:
         out.append(rebuild_user_rights(connection_string, cs_companies_id=cs_companies_id))
