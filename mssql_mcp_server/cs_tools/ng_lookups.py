@@ -22,6 +22,62 @@ from .ng_window import ng_bulk_layout
 # 15. ng_add_lookup
 # ---------------------------------------------------------------------------
 
+_SET_CANDIDATE_SUFFIXES = ("Id", "G", "Ident", "Desc", "Code")
+_SET_CANDIDATE_SKIP = {"csappnamespacesg"}
+
+
+def _propose_set_candidates(cur, namespace_g, app_window_ident, data_set_ident,
+                            field_ident, lookup_window_ident, lookup_ds,
+                            source_kind, explicit_sets):
+    """Match lookup-window fields to host fields that lack a Set mapping.
+    Conventions (evidence: csDocsHeaders_Agreements 2026-07-25 — Id+Desc Sets existed,
+    the symbol/VATCode ones were silently missing, so lookup picks did not refresh them):
+      - exact case-insensitive ident match for *Id/*G/*Ident/*Desc/*Code lookup fields;
+      - symbol field == host prefix: lookup 'paymentType' -> host 'PaymentType'
+        (host field 'PaymentTypeDesc' -> prefix 'PaymentType', match is CI);
+      - host-prefix concat: host 'CustomerDesc' -> prefix 'Customer', lookup 'VATCode'
+        -> host 'CustomerVATCode'.
+    Returns [{'from_field':..,'to_field':..}] not covered by DB rows nor explicit_sets."""
+    host_table = ("csNGAppWindowDataSetsFields" if source_kind == "rows"
+                  else "csNGAppWindowDataSetsWhereFields")
+    cur.execute(
+        f"select dataFieldIdent from dbo.{host_table} with(nolock) "
+        "where csAppNameSpacesG = ? and appWindowIdent = ? and dataSetIdent = ?",
+        namespace_g, app_window_ident, data_set_ident,
+    )
+    host_by_lower = {r[0].lower(): r[0] for r in cur.fetchall()}
+    cur.execute(
+        "select distinct dataFieldIdent from dbo.csNGAppWindowDataSetsFields with(nolock) "
+        "where csAppNameSpacesG = ? and appWindowIdent = ? and dataSetIdent = ? and addToSelect = 1",
+        namespace_g, lookup_window_ident, lookup_ds,
+    )
+    lookup_fields = [r[0] for r in cur.fetchall()]
+    cur.execute(
+        "select dataFieldIdentFrom, dataFieldIdentTo "
+        "from dbo.csNGAppWindowDataSetsLookupDefsSet with(nolock) "
+        "where csAppNameSpacesG = ? and appWindowIdent = ? and dataSetIdent = ? and dataFieldIdent = ?",
+        namespace_g, app_window_ident, data_set_ident, field_ident,
+    )
+    covered = {((t or f) or "").lower() for f, t in cur.fetchall()}
+    covered |= {((s.get("to_field") or s.get("from_field")) or "").lower() for s in explicit_sets}
+    prefix = field_ident[:-4] if field_ident.lower().endswith("desc") else field_ident
+
+    out = []
+    for lf in lookup_fields:
+        lfl = lf.lower()
+        if lfl in _SET_CANDIDATE_SKIP:
+            continue
+        target = None
+        if lfl in host_by_lower and (lf.endswith(_SET_CANDIDATE_SUFFIXES) or lfl == prefix.lower()):
+            target = host_by_lower[lfl]
+        elif (prefix + lf).lower() in host_by_lower:
+            target = host_by_lower[(prefix + lf).lower()]
+        if target is None or target.lower() in covered:
+            continue
+        out.append({"from_field": lf, "to_field": target})
+    return out
+
+
 def ng_add_lookup(
     connection_string: str,
     app_window_ident: str,
@@ -34,6 +90,7 @@ def ng_add_lookup(
     search_get: bool = True,
     gets: Optional[Sequence[dict]] = None,
     sets: Optional[Sequence[dict]] = None,
+    auto_sets: bool = False,
     namespace_g: str = DEFAULT_NAMESPACE_G,
 ) -> str:
     """
@@ -47,6 +104,11 @@ def ng_add_lookup(
       - Set rows default: lookup rows -> host (sourceKindTo = DEF.sourceKind);
         dataSetIdentFrom defaults to the lookup window's FIRST dataset (may be != main);
       - Get with 'value' -> sourceKindFrom='value' + dataFieldValueFrom (constant filter);
+      - SET candidates: lookup fields are matched to host fields by convention
+        (*Id/*G/*Ident/*Desc/*Code exact CI match, symbol==host-prefix like
+        paymentType -> PaymentType, host-prefix+field like VATCode -> CustomerVATCode);
+        unmapped matches are REPORTED as a warning, auto_sets=True wires them too
+        (a missing Set = lookup pick silently does not refresh that host field);
       - idempotent: existing identical mappings are skipped;
       - warns when the lookup window is missing onlyAsLookup=1 or has no sort idents.
 
@@ -57,8 +119,8 @@ def ng_add_lookup(
     """
     if source_kind not in ("rows", "where"):
         return "Error: source_kind must be 'rows' (form field) or 'where' (filter panel)."
-    if not sets and not search_get and not gets:
-        return "Error: nothing to wire — provide sets/gets or leave search_get=True."
+    if not sets and not search_get and not gets and not auto_sets:
+        return "Error: nothing to wire — provide sets/gets/auto_sets or leave search_get=True."
 
     warnings: List[str] = []
     log: List[str] = []
@@ -140,6 +202,25 @@ def ng_add_lookup(
                 return f"LookupDefs JSONSave WARNING:\n{resp}"
             log.append(f"DEF {field_ident} -> {lookup_window_ident} ({'U' if d else 'I'}, "
                        f"sourceKind={source_kind})")
+
+            # --- SET candidates (todo pkt 2): matches computed BEFORE wiring, against
+            #     DB rows + explicitly passed sets; auto_sets=True appends them to the
+            #     normal SET loop below, otherwise they are reported as a warning ---
+            candidates = _propose_set_candidates(
+                cur, namespace_g, app_window_ident, data_set_ident, field_ident,
+                lookup_window_ident, lookup_ds, source_kind, sets or [],
+            )
+            if candidates and auto_sets:
+                sets = list(sets or []) + candidates
+                log.append("AUTO-SETS (matched by convention): "
+                           + ", ".join(f"{c['from_field']} -> {c['to_field']}" for c in candidates))
+            elif candidates:
+                warnings.append(
+                    "SET candidates NOT wired — matching lookup->host fields without a Set "
+                    "(lookup pick will not refresh them); re-run with auto_sets=true or pass sets=["
+                    + ", ".join("{'from_field': '%s', 'to_field': '%s'}"
+                                % (c["from_field"], c["to_field"]) for c in candidates)
+                    + "].")
 
             # --- GET rows ---
             get_rows: List[dict] = []
@@ -243,9 +324,17 @@ def ng_add_lookup(
                 n_set += 1
                 log.append(f"SET {from_field} [{ds_from}] -> {to_field} [{sk_to}]")
 
+            # DB state, not call args — a re-run on an already-wired lookup is fine
+            total_sets = _exec_scalar(
+                cur,
+                "select count(*) from dbo.csNGAppWindowDataSetsLookupDefsSet with(nolock) "
+                "where csAppNameSpacesG = ? and appWindowIdent = ? and dataSetIdent = ? and dataFieldIdent = ?",
+                namespace_g, app_window_ident, data_set_ident, field_ident,
+            )
+
     msg = (f"OK: lookup {app_window_ident}/{data_set_ident}/{field_ident} -> {lookup_window_ident} "
            f"(+{n_get} get, +{n_set} set).\n  " + "\n  ".join(log))
-    if not sets:
+    if not total_sets:
         warnings.append("no Set mappings — the lookup will open but select nothing back; "
                         "add sets like [{'from_field': 'csXId'}, {'from_field': 'XDesc'}].")
     if warnings:

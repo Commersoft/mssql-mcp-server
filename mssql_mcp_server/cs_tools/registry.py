@@ -627,7 +627,11 @@ def tool_descriptors():
                 "conventions: csAppNameSpacesGLookup on INSERT, sourceKind on every Get/Set "
                 "row (silently ignored otherwise), source_kind='rows' (form) vs 'where' "
                 "(filter panel host, auto closeKind=onLostFocus), auto Get host->searchText, "
-                "Set dataSetIdentFrom = lookup's first dataset. Idempotent. Warns about "
+                "Set dataSetIdentFrom = lookup's first dataset. Proposes SET candidates by "
+                "matching lookup fields to host fields (*Id/*G/*Ident/*Desc/*Code exact CI, "
+                "symbol==host-prefix like paymentType->PaymentType, host-prefix+field like "
+                "VATCode->CustomerVATCode); auto_sets=true wires them (missing Set = lookup "
+                "pick silently does not refresh the field). Idempotent. Warns about "
                 "missing onlyAsLookup/sort idents on the lookup window."
             ),
             inputSchema={
@@ -651,6 +655,7 @@ def tool_descriptors():
                         "items": {"type": "object"},
                         "description": "Set mappings (lookup row -> host): [{from_field, to_field? (default =from_field), data_set_ident_from?, source_kind_to?}]. Typically Id + Desc pair.",
                     },
+                    "auto_sets": {"type": "boolean", "description": "Also wire the convention-matched SET candidates automatically (default false = report them only)."},
                     "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
                 },
                 "required": ["app_window_ident", "field_ident", "lookup_window_ident"],
@@ -1107,6 +1112,7 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             search_get=bool(arguments.get("search_get", True)),
             gets=arguments.get("gets"),
             sets=arguments.get("sets"),
+            auto_sets=bool(arguments.get("auto_sets", False)),
             namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
         )
 
