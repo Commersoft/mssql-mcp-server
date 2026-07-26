@@ -1172,6 +1172,7 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             ord=int(arguments.get("ord") or 1),
             labels=arguments.get("labels"),
             tab_default=arguments.get("tab_default"),
+            wire_one_item_only=bool(arguments.get("wire_one_item_only", True)),
             namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
         )
 
