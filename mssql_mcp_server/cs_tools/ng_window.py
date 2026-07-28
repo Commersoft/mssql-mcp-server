@@ -222,27 +222,41 @@ def add_ng_field(
 # 6. update_view_html  (sync .vue <template> -> DB viewHTML, like husky)
 # ---------------------------------------------------------------------------
 
+_TEMPLATE_TAG_RE = re.compile(r"<template(?=[\s>])|</template\s*>", re.IGNORECASE)
+
+
 def _extract_template(vue_source: str) -> Optional[str]:
     """
-    Extract the inner content of the ROOT <template>...</template> block, replicating
-    the husky/csRestAPIcsNGAppWindowsViewHTMLSave logic: take the lines strictly
-    between a line that is exactly '<template>' and the LAST line that is exactly
-    '</template>', trim each line, drop blanks, join with CRLF, then ##asterix## -> *.
-    Nested slot templates (<template #slot>) are preserved (they are not exact
-    '<template>' so they don't move the boundaries).
+    Extract the inner content of the ROOT <template>...</template> block: trim each
+    line, drop blanks, join with CRLF, then ##asterix## -> *  (content convention of
+    csNGAppWindows.viewHTML, same as the husky hook).
+
+    The closing boundary is found by NESTING COUNT, not by matching a line that is
+    exactly '</template>'. Line matching picked the wrong boundary in both directions
+    and silently truncated viewHTML in the DB (runtime X_MISSING_END_TAG, 2026-07-28):
+      - root '</template>' does not have to sit alone on its line
+        (csB2BPortalsSearchWords had '  </c-window-auto></template>'),
+      - while a NESTED <template v-for> / <template v-else> / <template #slot> closes
+        with '</template>' alone on its line — so it looked like the root.
     """
-    lines = vue_source.splitlines()
-    start = None
-    end = None
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if s == "<template>" and start is None:
-            start = i
-        if s == "</template>":
-            end = i
-    if start is None or end is None or end <= start:
+    open_m = re.search(r"<template\s*>", vue_source, re.IGNORECASE)
+    if open_m is None:
         return None
-    inner = [line.strip() for line in lines[start + 1:end]]
+
+    depth = 0
+    close_at = None
+    for m in _TEMPLATE_TAG_RE.finditer(vue_source, open_m.start()):
+        if m.group(0).startswith("</"):
+            depth -= 1
+            if depth == 0:
+                close_at = m.start()
+                break
+        else:
+            depth += 1
+    if close_at is None:
+        return None
+
+    inner = [line.strip() for line in vue_source[open_m.end():close_at].splitlines()]
     inner = [line for line in inner if line != ""]
     template = "\r\n".join(inner).replace("##asterix##", "*")
     return template or None
