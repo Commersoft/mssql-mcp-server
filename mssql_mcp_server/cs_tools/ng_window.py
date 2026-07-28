@@ -238,6 +238,10 @@ def _extract_template(vue_source: str) -> Optional[str]:
         (csB2BPortalsSearchWords had '  </c-window-auto></template>'),
       - while a NESTED <template v-for> / <template v-else> / <template #slot> closes
         with '</template>' alone on its line — so it looked like the root.
+
+    A SELF-CLOSING nested template ('<template #header />') has no closing tag, so it
+    must NOT increase the depth — otherwise depth never returns to 0 and the whole file
+    is rejected (incydent csUsrEMailsInbox 2026-07-28).
     """
     open_m = re.search(r"<template\s*>", vue_source, re.IGNORECASE)
     if open_m is None:
@@ -252,6 +256,9 @@ def _extract_template(vue_source: str) -> Optional[str]:
                 close_at = m.start()
                 break
         else:
+            gt = vue_source.find(">", m.end())
+            if gt != -1 and vue_source[gt - 1] == "/":
+                continue  # self-closing <template ... /> — no matching close tag
             depth += 1
     if close_at is None:
         return None
