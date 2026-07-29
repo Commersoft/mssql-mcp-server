@@ -40,7 +40,8 @@ setup(
     ],
     python_requires='>=3.8',
     install_requires=[
-        'mcp>=0.1.0',
+        # mcp 2.x usunęło lowlevel API (Server.list_resource_templates) używane w server.py -> pin na 1.x
+        'mcp>=1.20,<2.0',
         'pyodbc>=4.0.0',
         'pydantic>=2.0.0',
     ],
