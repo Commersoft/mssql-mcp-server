@@ -297,7 +297,7 @@ def search_files(
             continue
         for path in _iter_files(root_path, use_exts):
             try:
-                text = path.read_text(encoding="utf-8", errors="ignore")
+                text = path.read_text(encoding="utf-8-sig", errors="ignore")
             except OSError:
                 continue
             total = score_text(text, tokens)
@@ -742,8 +742,8 @@ def get_file(relpath: str) -> str:
         # Truncate to keep responses bounded
         with target.open("rb") as fh:
             data = fh.read(_MAX_FILE_BYTES)
-        return data.decode("utf-8", errors="ignore") + f"\n\n[... truncated, file size={size} bytes ...]"
-    return target.read_text(encoding="utf-8", errors="ignore")
+        return data.decode("utf-8-sig", errors="ignore") + f"\n\n[... truncated, file size={size} bytes ...]"
+    return target.read_text(encoding="utf-8-sig", errors="ignore")
 
 
 # ---------------------------------------------------------------------------

@@ -396,7 +396,8 @@ def _reload_env_file() -> None:
     env_path = os.path.join(os.path.dirname(here), ".env")
     if not os.path.exists(env_path):
         return
-    with open(env_path, encoding="utf-8") as fh:
+    # utf-8-sig: BOM w .env zamieniłby pierwszy klucz na "﻿MSSQL_SERVER" i cicho go zgubił
+    with open(env_path, encoding="utf-8-sig") as fh:
         for line in fh:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:

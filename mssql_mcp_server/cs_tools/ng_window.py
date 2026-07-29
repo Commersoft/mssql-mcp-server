@@ -297,7 +297,8 @@ def update_view_html(
         if not file_path:
             return "Error: provide file_path or content."
         try:
-            with open(file_path, "r", encoding="utf-8") as fh:
+            # utf-8-sig: BOM z .vue nie może wjechać na początek viewHTML w bazie
+            with open(file_path, "r", encoding="utf-8-sig") as fh:
                 content = fh.read()
         except OSError as exc:
             return f"Error: cannot read file_path: {exc}"

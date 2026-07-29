@@ -64,7 +64,9 @@ def _print_result(cursor, batch_label=""):
 
 def main():
     _load_env()
-    with open(sys.argv[1], encoding="utf-8") as fh:
+    # utf-8-sig, nie utf-8 — PowerShell 5.1 (Out-File/Set-Content -Encoding UTF8) zapisuje BOM,
+    # a MSSQL traktuje go jako znak: "Incorrect syntax near '﻿'"
+    with open(sys.argv[1], encoding="utf-8-sig") as fh:
         query = fh.read()
     # split na separatorach GO (case-insensitive, osobna linia) — pyodbc nie zna GO
     batches = [b.strip() for b in re.split(r"(?im)^\s*GO\s*$", query) if b.strip()]

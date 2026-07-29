@@ -17,7 +17,9 @@ CS = (
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    with open(sys.argv[1], encoding="utf-8") as fh:
+    # utf-8-sig, nie utf-8 — PowerShell 5.1 (Out-File/Set-Content -Encoding UTF8) zapisuje BOM,
+    # a MSSQL traktuje go jako znak: "Incorrect syntax near '﻿'"
+    with open(sys.argv[1], encoding="utf-8-sig") as fh:
         query = fh.read()
     # autocommit=True: bez tego pyodbc trzyma niejawna transakcje -> procedury cs* widza
     # @@trancount=1, nie robia wlasnego rollbacku przy bledzie, a blok `with` commituje
