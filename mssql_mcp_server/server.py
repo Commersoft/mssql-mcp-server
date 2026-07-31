@@ -306,7 +306,7 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
         "hint": "Baza testowa Grodno (kopia PROD). Zapis wymaga allow_write=true (odblokowane 2026-07-16 dla testów wyszukiwarki).",
     },
     "CERES_TEST": {
-        "server": r"CERES\TEST",
+        "server": "CERES_TEST",
         "database": "test13",
         "user_env": "CSCERESTEST_USER",
         "password_env": "CSCERESTEST_PWD",
