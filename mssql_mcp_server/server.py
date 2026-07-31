@@ -304,6 +304,14 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
         "hard_readonly": False,
         "hint": "Baza testowa Grodno (kopia PROD). Zapis wymaga allow_write=true (odblokowane 2026-07-16 dla testów wyszukiwarki).",
     },
+    "CERES_TEST": {
+        "server": "172.19.1.10",
+        "database": "test13",
+        "user_env": "CSCERESTEST_USER",
+        "password_env": "CSCERESTEST_PWD",
+        "hard_readonly": False,
+        "hint": "Ceres TEST (CERTUSOFT-SQL-T/test13) — klient Ceres, projekt VueCeres. Zapis wymaga allow_write=true.",
+    },
 }
 
 _WRITE_TOKEN_RE = re.compile(
@@ -902,7 +910,8 @@ async def list_tools() -> List[Tool]:
             description=(
                 "Execute an SQL query (REQUIRED param: query — NOT 'sql'). Default target = DEV (from .env). Optional `server` targets a named "
                 "profile: PROD (cs-sql03/cs04 — Grodno), PLAY (csPlay), LOT (csLot), CSSQL01 (cs-sql01\\cs — czas pracy), "
-                "SAVPOL (CS-SQL02\\SAVPOL/cs06), TESTGRODNO (CS-BCKP01\\GRODNO/test04 — kopia PROD do testów). "
+                "SAVPOL (CS-SQL02\\SAVPOL/cs06), TESTGRODNO (CS-BCKP01\\GRODNO/test04 — kopia PROD do testów), "
+                "CERES_TEST (CERTUSOFT-SQL-T/test13 — klient Ceres). "
                 "Non-DEV profiles are READ-ONLY by default: insert/update/delete/exec/DDL are rejected unless "
                 "allow_write=true. Schema changes on PROD are forbidden regardless (use csSysChanges packages)."
             ),
@@ -915,7 +924,7 @@ async def list_tools() -> List[Tool]:
                     },
                     "server": {
                         "type": "string",
-                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO"],
+                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
                         "description": "Target environment (default DEV)."
                     },
                     "allow_write": {
