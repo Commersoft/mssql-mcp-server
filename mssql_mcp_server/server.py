@@ -283,7 +283,8 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
     "CSSQL01": {
         "server": r"cs-sql01\cs",
         "database": "cs",
-        "user": "adminjmk",
+        "user_env": "CSSQL01_USER",
+        "user": "adminjmk",  # fallback gdy CSSQL01_USER nieustawiony
         "password_env": "CSSQL01_PWD",
         "hard_readonly": False,
         "hint": "cs-sql01\\cs (czas pracy). CustomerDesc/ProjectDesc, nie Desc_PL.",
@@ -436,7 +437,8 @@ def resolve_profile_connection(profile_name: str) -> Tuple[str, str]:
     server = prof["server"] or dev_config["server"]
     database = prof["database"]
     if prof.get("user_env"):
-        user = _getenv_reloading(prof["user_env"])
+        # env wygrywa nad wpisem w profilu; brak obu = błąd z podpowiedzią, którą zmienną ustawić
+        user = _getenv_reloading(prof["user_env"]) or prof.get("user")
         if not user:
             raise ValueError(f"Profile {profile_name}: set env {prof['user_env']} (user).")
     else:
