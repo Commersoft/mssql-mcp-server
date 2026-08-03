@@ -66,6 +66,7 @@ env/
 # Project specific
 *.log
 .env
+.env-*
 .env.local
 .env.*.local
 
