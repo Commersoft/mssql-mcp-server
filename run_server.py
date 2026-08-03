@@ -10,13 +10,16 @@ def _load_env():
     env_path = os.path.join(here, ".env")
     if os.path.exists(env_path):
         # utf-8-sig: .env bywa zapisany z BOM — zwykły utf-8 psuje pierwszy klucz (MSSQL_SERVER -> localhost)
+        # .env projektu MUSI wygrywać z odziedziczonym środowiskiem procesu-rodzica (VS Code) —
+        # setdefault() cicho ignorował .env, gdy MSSQL_SERVER/MSSQL_DATABASE były już ustawione
+        # w środowisku (incydent 2026-08-03: patch trafił w testLot@CS-SQL03\TESTLOT zamiast csLot@10.176.130.60)
         with open(env_path, encoding="utf-8-sig") as fh:
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
+                os.environ[k.strip()] = v.strip()
 
 
 if __name__ == "__main__":
