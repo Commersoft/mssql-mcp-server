@@ -81,7 +81,7 @@ def tool_descriptors():
                 "type": "object",
                 "properties": {
                     "object_name": {"type": "string", "description": "Object name (dbo. prefix optional), e.g. 'csNGAppWindowDataSetsActionsFields'."},
-                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO"],
                                "description": "Target environment (default DEV)."},
                 },
                 "required": ["object_name"],
@@ -102,7 +102,7 @@ def tool_descriptors():
                     "pattern": {"type": "string", "description": "Literal substring to find (case-insensitive)."},
                     "name_like": {"type": "string", "description": "Optional: only objects whose name contains this."},
                     "top": {"type": "integer", "description": "Max hits (default 100)."},
-                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO"],
                                "description": "Target environment (default DEV)."},
                 },
                 "required": ["pattern"],

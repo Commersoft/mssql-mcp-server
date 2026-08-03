@@ -300,8 +300,9 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
     "TESTGRODNO": {
         "server": r"CS-BCKP01\GRODNO",
         "database": "test04",
-        "user_env": "CSTESTGRODNO_USER",
-        "password_env": "CSTESTGRODNO_PWD",
+        # ten sam serwer co SLGRODNO — jeśli nie ma osobnych creds, bierz tamte
+        "user_env": ("CSTESTGRODNO_USER", "CSSLGRODNO_USER"),
+        "password_env": ("CSTESTGRODNO_PWD", "CSSLGRODNO_PWD"),
         "hard_readonly": False,
         "hint": "Baza testowa Grodno (kopia PROD). Zapis wymaga allow_write=true (odblokowane 2026-07-16 dla testów wyszukiwarki).",
     },
@@ -312,6 +313,15 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
         "password_env": "CSCERESTEST_PWD",
         "hard_readonly": False,
         "hint": "Ceres TEST (CERTUSOFT-SQL-T/test13) — klient Ceres, projekt VueCeres. Zapis wymaga allow_write=true.",
+    },
+    "SLGRODNO": {
+        "server": r"CS-BCKP01\GRODNO",
+        "database": "sl_grodno",
+        # ten sam serwer co TESTGRODNO — jeśli nie ma osobnych creds, bierz tamte
+        "user_env": ("CSSLGRODNO_USER", "CSTESTGRODNO_USER"),
+        "password_env": ("CSSLGRODNO_PWD", "CSTESTGRODNO_PWD"),
+        "hard_readonly": False,
+        "hint": "Baza sl_grodno na CS-BCKP01\\GRODNO — POZA modelem cs* (brak <T>JSONSave/csSysChanges). Zapis wymaga allow_write=true.",
     },
 }
 
@@ -424,6 +434,24 @@ def _getenv_reloading(name: str) -> Optional[str]:
     return val
 
 
+def _env_name_list(spec) -> List[str]:
+    """Profile creds may name one env var or a fallback chain (tuple/list)."""
+    return [spec] if isinstance(spec, str) else list(spec)
+
+
+def _first_env(spec) -> Optional[str]:
+    """First non-empty value from the profile's env-var chain."""
+    for name in _env_name_list(spec):
+        val = _getenv_reloading(name)
+        if val:
+            return val
+    return None
+
+
+def _env_names(spec) -> str:
+    return " / ".join(_env_name_list(spec))
+
+
 def resolve_profile_connection(profile_name: str) -> Tuple[str, str]:
     """Build (connection_string, label) for a named server profile.
     Raises ValueError with an actionable message when creds are missing."""
@@ -438,16 +466,18 @@ def resolve_profile_connection(profile_name: str) -> Tuple[str, str]:
     database = prof["database"]
     if prof.get("user_env"):
         # env wygrywa nad wpisem w profilu; brak obu = błąd z podpowiedzią, którą zmienną ustawić
-        user = _getenv_reloading(prof["user_env"]) or prof.get("user")
+        user = _first_env(prof["user_env"]) or prof.get("user")
         if not user:
-            raise ValueError(f"Profile {profile_name}: set env {prof['user_env']} (user).")
+            raise ValueError(
+                f"Profile {profile_name}: set env {_env_names(prof['user_env'])} (user)."
+            )
     else:
         user = prof["user"] or os.getenv("MSSQL_USER")
     if prof.get("password_env"):
-        password = _getenv_reloading(prof["password_env"])
+        password = _first_env(prof["password_env"])
         if not password:
             raise ValueError(
-                f"Profile {profile_name}: missing env {prof['password_env']} (password). "
+                f"Profile {profile_name}: missing env {_env_names(prof['password_env'])} (password). "
                 f"Poproś użytkownika o hasło / ustaw w mssql-mcp-server/.env."
             )
     else:
@@ -913,7 +943,8 @@ async def list_tools() -> List[Tool]:
                 "Execute an SQL query (REQUIRED param: query — NOT 'sql'). Default target = DEV (from .env). Optional `server` targets a named "
                 "profile: PROD (cs-sql03/cs04 — Grodno), PLAY (csPlay), LOT (csLot), CSSQL01 (cs-sql01\\cs — czas pracy), "
                 "SAVPOL (CS-SQL02\\SAVPOL/cs06), TESTGRODNO (CS-BCKP01\\GRODNO/test04 — kopia PROD do testów), "
-                "CERES_TEST (CERTUSOFT-SQL-T/test13 — klient Ceres). "
+                "CERES_TEST (CERTUSOFT-SQL-T/test13 — klient Ceres), "
+                "SLGRODNO (CS-BCKP01\\GRODNO/sl_grodno — baza spoza modelu cs*). "
                 "Non-DEV profiles are READ-ONLY by default: insert/update/delete/exec/DDL are rejected unless "
                 "allow_write=true. Schema changes on PROD are forbidden regardless (use csSysChanges packages)."
             ),
@@ -926,7 +957,7 @@ async def list_tools() -> List[Tool]:
                     },
                     "server": {
                         "type": "string",
-                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
+                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO"],
                         "description": "Target environment (default DEV)."
                     },
                     "allow_write": {
