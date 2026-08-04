@@ -1113,7 +1113,9 @@ async def main():
             with conn.cursor() as cursor:
                 cursor.execute("SELECT @@VERSION")
                 version = cursor.fetchone()[0]
-                logger.info(f"Connected to SQL Server: {version.split('\\n')[0]}")
+                # Split outside the f-string: backslashes in f-string expressions are a SyntaxError before Python 3.12
+                version_first_line = version.split("\n")[0]
+                logger.info(f"Connected to SQL Server: {version_first_line}")
         
     except Exception as e:
         logger.error(f"Failed to connect to database: {str(e)}")
