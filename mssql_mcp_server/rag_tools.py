@@ -366,8 +366,14 @@ def get_sql_object(connection_string: str, object_name: str) -> str:
                 )
                 rows = cur.fetchall()
                 if rows:
-                    # Concatenate first column of every row
-                    return "\n".join(
+                    # Concatenate first column of every row.
+                    # CRLF, nie LF: ten zrzut jest jednocześnie gotowym skryptem wdrożeniowym
+                    # 3-batch (csAddObjVer + treść + csSysRestoreObject), a procedury cs* w bazie
+                    # mają CRLF. Sklejanie po "\n" powodowało, że redeploy z edytowanego zrzutu
+                    # zapisywał ciało LF-only, a wtedy skryptowanie zwracało 1-2 wiersze po
+                    # dziesiątki tysięcy znaków i wyglądało na UCIĘTĄ procedurę.
+                    # Incydent: csNGOnCFMails 2026-08-18.
+                    return "\r\n".join(
                         (r[0] if r[0] is not None else "") for r in rows
                     )
             except Exception as ex:
