@@ -841,7 +841,7 @@ def tool_descriptors():
                     },
                     "server": {
                         "type": "string",
-                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO", "PBS"],
+                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO", "PBS", "PBSTEST"],
                         "description": "Target environment (default DEV).",
                     },
                 },

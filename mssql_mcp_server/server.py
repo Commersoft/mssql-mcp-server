@@ -331,6 +331,14 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
         "hard_readonly": False,
         "hint": "PRODUKCJA instalacji PBS (CS-SQL03\\PBS/csPBS) — osobna instancja, jedyna baza cs* to csPBS. Zmiany struktury/kodu wyłącznie pakietami csSysChanges; dane tylko przez <T>JSONSave.",
     },
+    "PBSTEST": {
+        "server": r"CS-BCKP01\PBS",
+        "database": "testPBS",
+        "user_env": "CSPBSTEST_USER",
+        "password_env": "CSPBSTEST_PWD",
+        "hard_readonly": False,
+        "hint": "TESTOWA instalacja PBS (CS-BCKP01\\PBS/testPBS) — środowisko prób przed csPBS. Po stronie Softlaba podpięta do 10.20.10.46/UAT_PBSC_MG — ta baza NIE ma tu profilu (inny model danych, osobny serwer MCP z repo pbs-softlab). Zapis wymaga allow_write=true.",
+    },
 }
 
 _WRITE_TOKEN_RE = re.compile(
@@ -952,7 +960,8 @@ async def list_tools() -> List[Tool]:
                 "profile: PROD (cs-sql03/cs04 — Grodno), PLAY (csPlay), LOT (csLot), CSSQL01 (cs-sql01\\cs — czas pracy), "
                 "SAVPOL (CS-SQL02\\SAVPOL/cs06), TESTGRODNO (CS-BCKP01\\GRODNO/test04 — kopia PROD do testów), "
                 "CERES_TEST (CERTUSOFT-SQL-T/test13 — klient Ceres), PBS (CS-SQL03\\PBS/csPBS — PRODUKCJA instalacji PBS), "
-                "SLGRODNO (CS-BCKP01\\GRODNO/sl_grodno — baza spoza modelu cs*). "
+                "SLGRODNO (CS-BCKP01\\GRODNO/sl_grodno — baza spoza modelu cs*), "
+                "PBSTEST (CS-BCKP01\\PBS/testPBS — TESTOWA instalacja PBS). "
                 "Non-DEV profiles are READ-ONLY by default: insert/update/delete/exec/DDL are rejected unless "
                 "allow_write=true. Schema changes on PROD are forbidden regardless (use csSysChanges packages)."
             ),
@@ -965,7 +974,7 @@ async def list_tools() -> List[Tool]:
                     },
                     "server": {
                         "type": "string",
-                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO", "PBS"],
+                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO", "PBS", "PBSTEST"],
                         "description": "Target environment (default DEV)."
                     },
                     "allow_write": {
