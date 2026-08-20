@@ -323,6 +323,14 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
         "hard_readonly": False,
         "hint": "Baza sl_grodno na CS-BCKP01\\GRODNO — POZA modelem cs* (brak <T>JSONSave/csSysChanges). Zapis wymaga allow_write=true.",
     },
+    "PBS": {
+        "server": r"CS-SQL03\PBS",
+        "database": "csPBS",
+        "user_env": "CSPBS_USER",
+        "password_env": "CSPBS_PWD",
+        "hard_readonly": False,
+        "hint": "PRODUKCJA instalacji PBS (CS-SQL03\\PBS/csPBS) — osobna instancja, jedyna baza cs* to csPBS. Zmiany struktury/kodu wyłącznie pakietami csSysChanges; dane tylko przez <T>JSONSave.",
+    },
 }
 
 _WRITE_TOKEN_RE = re.compile(
@@ -943,7 +951,7 @@ async def list_tools() -> List[Tool]:
                 "Execute an SQL query (REQUIRED param: query — NOT 'sql'). Default target = DEV (from .env). Optional `server` targets a named "
                 "profile: PROD (cs-sql03/cs04 — Grodno), PLAY (csPlay), LOT (csLot), CSSQL01 (cs-sql01\\cs — czas pracy), "
                 "SAVPOL (CS-SQL02\\SAVPOL/cs06), TESTGRODNO (CS-BCKP01\\GRODNO/test04 — kopia PROD do testów), "
-                "CERES_TEST (CERTUSOFT-SQL-T/test13 — klient Ceres), "
+                "CERES_TEST (CERTUSOFT-SQL-T/test13 — klient Ceres), PBS (CS-SQL03\\PBS/csPBS — PRODUKCJA instalacji PBS), "
                 "SLGRODNO (CS-BCKP01\\GRODNO/sl_grodno — baza spoza modelu cs*). "
                 "Non-DEV profiles are READ-ONLY by default: insert/update/delete/exec/DDL are rejected unless "
                 "allow_write=true. Schema changes on PROD are forbidden regardless (use csSysChanges packages)."
@@ -957,7 +965,7 @@ async def list_tools() -> List[Tool]:
                     },
                     "server": {
                         "type": "string",
-                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO"],
+                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO", "PBS"],
                         "description": "Target environment (default DEV)."
                     },
                     "allow_write": {
