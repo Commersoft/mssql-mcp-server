@@ -259,7 +259,8 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
     "PROD": {
         "server": "cs-sql03",
         "database": "cs04",
-        "user": "adminjmk",
+        "user_env": "CSPROD_USER",
+        "user": "adminjmk",  # fallback when CSPROD_USER is not set
         "password_env": "CSPROD_PWD",
         "hard_readonly": False,
         "is_production": True,
