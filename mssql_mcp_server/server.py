@@ -475,7 +475,12 @@ def _reload_env_file() -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+            v = v.strip()
+            # cudzysłowy z .env (CSSQL01_USER="adminjmk") muszą zlecieć — inaczej idą
+            # do connection stringu i login pada 18456 (incydent 2026-08-22)
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                v = v[1:-1]
+            os.environ.setdefault(k.strip(), v)
 
 
 def _getenv_reloading(name: str) -> Optional[str]:

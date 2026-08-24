@@ -20,7 +20,12 @@ def _load_env():
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
+                v = v.strip()
+                # cudzysłowy w .env chronią '#' w haśle — do connection stringu iść nie mogą,
+                # inaczej login pada 18456 (regresja wracała już 3× — patrz rag-mcp-tools §3)
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                os.environ.setdefault(k.strip(), v)
 
 
 def _connection_string() -> str:

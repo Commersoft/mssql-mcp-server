@@ -4,6 +4,15 @@ Simple runner script for MSSQL MCP Server
 This ensures the server runs correctly when called from MCP configuration
 """
 
+def _unquote(value):
+    """Zdejmij cudzysłowy z wartości .env — CSSQL01_USER="adminjmk" bez tego trafia
+    do connection stringu razem z cudzysłowami i login pada 18456 (incydent 2026-08-22,
+    profile PROD/CSSQL01/TESTGRODNO/SAVPOL padały wszystkie naraz)."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
 def _load_env():
     import os
     here = os.path.dirname(os.path.abspath(__file__))
@@ -19,7 +28,7 @@ def _load_env():
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                os.environ[k.strip()] = v.strip()
+                os.environ[k.strip()] = _unquote(v.strip())
 
 
 if __name__ == "__main__":
