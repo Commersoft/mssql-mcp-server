@@ -262,6 +262,7 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
         "user": "adminjmk",
         "password_env": "CSPROD_PWD",
         "hard_readonly": False,
+        "is_production": True,
         "hint": "PROD Grodno (cs-sql03/cs04). Zmiany danych tylko przez pakiety csSysChanges!",
     },
     "PLAY": {
@@ -323,6 +324,23 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
         "hard_readonly": False,
         "hint": "Baza sl_grodno na CS-BCKP01\\GRODNO — POZA modelem cs* (brak <T>JSONSave/csSysChanges). Zapis wymaga allow_write=true.",
     },
+    "PBS": {
+        "server": r"CS-SQL03\PBS",
+        "database": "csPBS",
+        "user_env": "CSPBS_USER",
+        "password_env": "CSPBS_PWD",
+        "hard_readonly": False,
+        "is_production": True,
+        "hint": "PRODUKCJA instalacji PBS (CS-SQL03\\PBS/csPBS) — osobna instancja, jedyna baza cs* to csPBS. Zmiany struktury/kodu wyłącznie pakietami csSysChanges; dane tylko przez <T>JSONSave.",
+    },
+    "PBSTEST": {
+        "server": r"CS-BCKP01\PBS",
+        "database": "testPBS",
+        "user_env": "CSPBSTEST_USER",
+        "password_env": "CSPBSTEST_PWD",
+        "hard_readonly": False,
+        "hint": "TESTOWA instalacja PBS (CS-BCKP01\\PBS/testPBS) — środowisko prób przed csPBS. Po stronie Softlaba podpięta do 10.20.10.46/UAT_PBSC_MG — ta baza NIE ma tu profilu (inny model danych, osobny serwer MCP z repo pbs-softlab). Zapis wymaga allow_write=true.",
+    },
 }
 
 _WRITE_TOKEN_RE = re.compile(
@@ -367,6 +385,41 @@ def find_write_token(sql: str) -> Optional[str]:
     """Return the first write-capable keyword outside strings/comments, or None."""
     m = _WRITE_TOKEN_RE.search(_strip_sql_literals_and_comments(sql))
     return m.group(1).lower() if m else None
+
+
+# Guard: schema changes on PRODUCTION profiles (is_production: True) — blocked regardless
+# of allow_write/allow_raw_ddl. Sanctioned paths: csSysChanges packages (structure) and
+# deploy_sql_object (code objects, consistent version chain). Temp objects (#...) stay
+# allowed — diagnostics on PROD legitimately build #temp tables (they still need
+# allow_write=true because of the 'create' write token).
+_SCHEMA_DDL_RE = re.compile(
+    r"(?is)\b(create|alter|drop)\s+(or\s+alter\s+)?"
+    r"(procedure|proc|function|view|trigger|table|index|schema|type|sequence|synonym|database|role|user|login)\b"
+)
+
+
+def find_production_ddl(sql: str) -> Optional[str]:
+    """Return a short label ('alter table', 'select into', ...) when the statement changes
+    the schema of a PERMANENT object; None for temp-only DDL (#tables, indexes on #tables)."""
+    stripped = _strip_sql_literals_and_comments(sql)
+    for m in _SCHEMA_DDL_RE.finditer(stripped):
+        verb, obj = m.group(1).lower(), m.group(3).lower()
+        tail = stripped[m.end():].lstrip()
+        if obj == "table" and tail.startswith(("#", "[#")):
+            continue  # create/alter/drop table #tmp
+        if obj == "index" and re.match(r"(?is)\[?\w+\]?\s+on\s+\[?#", tail):
+            continue  # create/drop index ... on #tmp
+        return f"{verb} {obj}"
+    # select ... into <permanent> tworzy tabelę bez słowa 'create'
+    for m in re.finditer(r"(?is)\binto\s+(.{0,2})", stripped):
+        before = stripped[:m.start()].rstrip().lower()
+        if before.endswith(("insert", "merge")):
+            continue  # insert/merge into = DML, nie DDL
+        head = m.group(1)
+        if "#" in head or head.startswith("@"):
+            continue  # select into #tmp / fetch into @var
+        return "select into (creates a permanent table)"
+    return None
 
 
 # Guard: create/alter of a MANAGED cs* code object outside the csAddObjVer framework.
@@ -943,10 +996,13 @@ async def list_tools() -> List[Tool]:
                 "Execute an SQL query (REQUIRED param: query — NOT 'sql'). Default target = DEV (from .env). Optional `server` targets a named "
                 "profile: PROD (cs-sql03/cs04 — Grodno), PLAY (csPlay), LOT (csLot), CSSQL01 (cs-sql01\\cs — czas pracy), "
                 "SAVPOL (CS-SQL02\\SAVPOL/cs06), TESTGRODNO (CS-BCKP01\\GRODNO/test04 — kopia PROD do testów), "
-                "CERES_TEST (CERTUSOFT-SQL-T/test13 — klient Ceres), "
-                "SLGRODNO (CS-BCKP01\\GRODNO/sl_grodno — baza spoza modelu cs*). "
+                "CERES_TEST (CERTUSOFT-SQL-T/test13 — klient Ceres), PBS (CS-SQL03\\PBS/csPBS — PRODUKCJA instalacji PBS), "
+                "SLGRODNO (CS-BCKP01\\GRODNO/sl_grodno — baza spoza modelu cs*), "
+                "PBSTEST (CS-BCKP01\\PBS/testPBS — TESTOWA instalacja PBS). "
                 "Non-DEV profiles are READ-ONLY by default: insert/update/delete/exec/DDL are rejected unless "
-                "allow_write=true. Schema changes on PROD are forbidden regardless (use csSysChanges packages)."
+                "allow_write=true. Schema changes on PRODUCTION profiles (PROD, PBS) are BLOCKED regardless "
+                "of allow_write/allow_raw_ddl — permanent create/alter/drop and select-into are rejected "
+                "(structure: csSysChanges packages; code objects: deploy_sql_object); temp objects (#...) allowed."
             ),
             inputSchema={
                 "type": "object",
@@ -957,7 +1013,7 @@ async def list_tools() -> List[Tool]:
                     },
                     "server": {
                         "type": "string",
-                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO"],
+                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO", "PBS", "PBSTEST"],
                         "description": "Target environment (default DEV)."
                     },
                     "allow_write": {
@@ -1075,6 +1131,15 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
                     f"Error: profile {profile_name} is ALWAYS read-only (statement contains '{token}'). "
                     f"{prof.get('hint', '')}"
                 ))]
+            if prof.get("is_production"):
+                ddl = find_production_ddl(query)
+                if ddl:
+                    return [TextContent(type="text", text=(
+                        f"Error: profile {profile_name} is PRODUCTION — schema changes ('{ddl}') are "
+                        f"blocked regardless of allow_write/allow_raw_ddl. Structure changes go through "
+                        f"csSysChanges packages, code objects through deploy_sql_object; temp objects "
+                        f"(#...) are allowed. {prof.get('hint', '')}"
+                    ))]
             if token and not allow_write:
                 return [TextContent(type="text", text=(
                     f"Error: profile {profile_name} is read-only by default and the statement contains "
