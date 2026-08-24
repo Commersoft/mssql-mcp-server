@@ -294,7 +294,8 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
     "SAVPOL": {
         "server": r"CS-SQL02\SAVPOL",
         "database": "cs06",
-        "user": "adminjmk",
+        "user_env": "CSSAVPOL_USER",
+        "user": "adminjmk",  # fallback gdy CSSAVPOL_USER nieustawiony
         "password_env": "CSSAVPOL_PWD",
         "hard_readonly": False,
         "hint": "Środowisko klienta Savpol. Hasło podaje user per-sesja (env CSSAVPOL_PWD).",
