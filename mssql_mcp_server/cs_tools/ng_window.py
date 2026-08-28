@@ -17,6 +17,7 @@ from ._core import (
     _exec_scalar,
     _jsonsave,
     _new_guid,
+    _stable_guid,
     _xml_response_to_text,
 )
 
@@ -785,6 +786,132 @@ def ng_upsert_cols_group(
     return (f"OK: cols group '{cols_group_ident}' {'updated' if g else 'created'} in {app_window_ident} "
             f"(langs: {', '.join(sorted(descriptions))}). Attach columns via ng_set_layout_col "
             f"(grouped columns must be adjacent by ord).")
+
+
+# ---------------------------------------------------------------------------
+# 10b. ng_upsert_tabs_group
+# ---------------------------------------------------------------------------
+
+def ng_upsert_tabs_group(
+    connection_string: str,
+    app_window_ident: str,
+    tab_group_ident: str,
+    descriptions: Optional[dict] = None,
+    ord: Optional[int] = None,
+    translate_ident: Optional[str] = None,
+    link_to_windows: Optional[Sequence[str]] = None,
+    namespace_g: str = DEFAULT_NAMESPACE_G,
+) -> str:
+    """
+    Upsert a tabs group of linked windows (csNGAppWindowTabsGroups — per MASTER window, the
+    analog of csNGAppWindowColsGroups). app_window_ident = the window hosting the tab bar
+    (= csNGAppWindowsLinks.appWindowIdentFrom). Column names are tabGroupDesc_XX; only the
+    provided languages are written (HARD RULE 13), PL is required on create (NOT NULL).
+    G of a new row is the stable md5('tabsGroup:<window>:<ident>') so DEV and PROD match
+    (HARD RULE 24). `ord` = explicit group order on the vertical tab bar (NULL = position of
+    the group's first tab); `translate_ident` = optional gT fallback (tabGroupTranslateIdent).
+    link_to_windows: appWindowIdentTo of existing links to attach (U with tabGroupIdent) —
+    done AFTER the group row exists because of the FK; the JSONSave custom code refreshes the
+    master's linkedWindows cache. Groups render only in vertical tab layouts.
+    """
+    descriptions = descriptions or {}
+    if descriptions and not isinstance(descriptions, dict):
+        return "Error: descriptions must be a dict, e.g. {'PL': 'Oferta', 'EN': 'Offer'}."
+    bad = [l for l in descriptions if l not in NG_COLSGROUP_LANGS]
+    if bad:
+        return f"Error: unsupported language(s): {', '.join(bad)} (allowed: {', '.join(NG_COLSGROUP_LANGS)})."
+    if not app_window_ident or not tab_group_ident:
+        return "Error: app_window_ident and tab_group_ident are required."
+
+    warnings: List[str] = []
+    with connect(connection_string, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            if not _exec_scalar(
+                cur,
+                "select count(*) from dbo.csNGAppWindows with(nolock) "
+                "where csAppNameSpacesG = ? and appWindowIdent = ?",
+                namespace_g, app_window_ident,
+            ):
+                return (f"Error: master window '{app_window_ident}' not found in csNGAppWindows "
+                        f"(namespace {namespace_g}) — the tabs group belongs to the window hosting the tab bar.")
+
+            cur.execute(
+                "select csNGAppWindowTabsGroupsId, csNGAppWindowTabsGroupsG "
+                "from dbo.csNGAppWindowTabsGroups with(nolock) "
+                "where csAppNameSpacesG = ? and appWindowIdent = ? and tabGroupIdent = ?",
+                namespace_g, app_window_ident, tab_group_ident,
+            )
+            g = cur.fetchone()
+            if not g and not descriptions.get("PL"):
+                return "Error: tabGroupDesc_PL is NOT NULL — pass descriptions with at least 'PL' when creating a group."
+
+            rec = {
+                "_opr": "U" if g else "I",
+                "csNGAppWindowTabsGroupsG": str(g[1]).upper() if g else _stable_guid(
+                    cur, f"tabsGroup:{app_window_ident}:{tab_group_ident}"),
+                "csAppNameSpacesG": namespace_g,
+                "appWindowIdent": app_window_ident,
+                "tabGroupIdent": tab_group_ident,
+            }
+            if g:
+                rec["csNGAppWindowTabsGroupsId"] = int(g[0])
+            for lang, text in descriptions.items():
+                rec[f"tabGroupDesc_{lang}"] = text
+            if ord is not None:
+                rec["ord"] = int(ord)
+            if translate_ident is not None:
+                rec["tabGroupTranslateIdent"] = translate_ident or None
+            if g and len(rec) == 6:
+                return f"Error: nothing to change for existing group '{tab_group_ident}' (pass descriptions / ord / translate_ident)."
+
+            resp = _jsonsave(cur, "csNGAppWindowTabsGroupsJSONSave", [rec])
+            if resp:
+                return f"TabsGroups JSONSave WARNING:\n{resp}"
+
+            linked = 0
+            if link_to_windows:
+                rows = []
+                for to_ident in link_to_windows:
+                    cur.execute(
+                        "select csNGAppWindowsLinksId, csNGAppWindowsLinksG, csAppNameSpacesGTo, tabGroupIdent "
+                        "from dbo.csNGAppWindowsLinks with(nolock) "
+                        "where csAppNameSpacesGFrom = ? and appWindowIdentFrom = ? and appWindowIdentTo = ?",
+                        namespace_g, app_window_ident, to_ident,
+                    )
+                    lk = cur.fetchone()
+                    if not lk:
+                        warnings.append(f"link {app_window_ident} -> {to_ident} does not exist (ng_add_linked_window first).")
+                        continue
+                    if lk[3] == tab_group_ident:
+                        continue
+                    rows.append({
+                        "_opr": "U",
+                        "csNGAppWindowsLinksId": int(lk[0]),
+                        "csNGAppWindowsLinksG": str(lk[1]).upper(),
+                        "csAppNameSpacesGFrom": namespace_g,
+                        "appWindowIdentFrom": app_window_ident,
+                        "csAppNameSpacesGTo": str(lk[2]).upper(),
+                        "appWindowIdentTo": to_ident,
+                        "tabGroupIdent": tab_group_ident,
+                    })
+                if rows:
+                    resp = _jsonsave(cur, "csNGAppWindowsLinksJSONSave", rows)
+                    if resp:
+                        return f"OK: group saved, but Links JSONSave WARNING:\n{resp}"
+                    linked = len(rows)
+
+    out = [
+        f"OK: tabs group '{tab_group_ident}' {'updated' if g else 'created'} in {app_window_ident} "
+        f"(langs: {', '.join(sorted(descriptions)) or '-'}"
+        f"{', ord=' + str(ord) if ord is not None else ''}"
+        f"{', translateIdent=' + translate_ident if translate_ident else ''}).",
+    ]
+    if link_to_windows is not None:
+        out.append(f"  links attached: {linked} (already in group / skipped: {len(link_to_windows) - linked - len(warnings)}).")
+    out.append("  linkedWindows cache of the master refreshed by the JSONSave custom code (on real changes); "
+               "groups render only in vertical tab layouts (outer-side-panel-tab-layout='left').")
+    out.extend(f"  WARNING: {w}" for w in warnings)
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------

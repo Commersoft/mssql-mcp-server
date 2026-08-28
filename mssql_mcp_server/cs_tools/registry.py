@@ -16,6 +16,7 @@ from .ng_window import (
     ng_set_sort,
     ng_set_stmsql,
     ng_upsert_cols_group,
+    ng_upsert_tabs_group,
     update_view_html,
 )
 from .ng_lookups import ng_add_filter, ng_add_linked_window, ng_add_lookup, ng_create_lookup_window
@@ -39,6 +40,7 @@ CS_TOOL_NAMES = {
     "ng_set_field_labels",
     "ng_set_layout_col",
     "ng_upsert_cols_group",
+    "ng_upsert_tabs_group",
     "ng_set_stmsql",
     "ng_set_dataset_props",
     "rebuild_user_rights",
@@ -532,6 +534,39 @@ def tool_descriptors():
                     "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
                 },
                 "required": ["app_window_ident", "cols_group_ident", "descriptions"],
+            },
+        ),
+        Tool(
+            name="ng_upsert_tabs_group",
+            description=(
+                "Upsert a tabs group of linked windows (csNGAppWindowTabsGroups — per MASTER window "
+                "hosting the tab bar; analog of cols groups): tabGroupDesc_XX per language (only provided "
+                "langs written, never copies PL; PL required on create), ord (explicit group order on the "
+                "vertical tab bar; NULL = position of the group's first tab), translate_ident (optional gT "
+                "fallback). Stable G = md5('tabsGroup:<window>:<ident>') so DEV/PROD match. link_to_windows "
+                "attaches the group to existing csNGAppWindowsLinks rows (appWindowIdentTo list) AFTER the "
+                "group row exists (FK) — the JSONSave custom code refreshes the master's linkedWindows cache. "
+                "Groups render only in vertical tab layouts (outer-side-panel-tab-layout='left')."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string", "description": "MASTER window (appWindowIdentFrom of the links)."},
+                    "tab_group_ident": {"type": "string", "description": "e.g. 'TAB_GROUP_OFFER'."},
+                    "descriptions": {
+                        "type": "object",
+                        "description": "{'PL': 'Oferta', 'EN': 'Offer', ...} — langs: PL,EN,DE,FR,ES,NL,PT,RU,UK,IT,SE,SK. PL required on create.",
+                    },
+                    "ord": {"type": "integer", "description": "Explicit group order on the tab bar."},
+                    "translate_ident": {"type": "string", "description": "Optional gT ident fallback (tabGroupTranslateIdent); '' clears."},
+                    "link_to_windows": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "appWindowIdentTo of existing links to attach to this group (sets csNGAppWindowsLinks.tabGroupIdent).",
+                    },
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident", "tab_group_ident"],
             },
         ),
         Tool(
@@ -1057,6 +1092,18 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             app_window_ident=arguments.get("app_window_ident", ""),
             cols_group_ident=arguments.get("cols_group_ident", ""),
             descriptions=arguments.get("descriptions") or {},
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "ng_upsert_tabs_group":
+        return ng_upsert_tabs_group(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            tab_group_ident=arguments.get("tab_group_ident", ""),
+            descriptions=arguments.get("descriptions") or {},
+            ord=arguments.get("ord"),
+            translate_ident=arguments.get("translate_ident"),
+            link_to_windows=arguments.get("link_to_windows"),
             namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
         )
 

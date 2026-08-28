@@ -28,6 +28,8 @@ Tools:
 - ng_set_layout_col   : upsert grid layout col props (width/isVisible/ord/colsGroupIdent)
                         via minimal-U (no natural key -> no label re-validation trap).
 - ng_upsert_cols_group : upsert a grid column group (csNGAppWindowColsGroups).
+- ng_upsert_tabs_group : upsert a tabs group of linked windows (csNGAppWindowTabsGroups,
+                        per master window) + optionally attach links (tabGroupIdent).
 - ng_set_stmsql       : replace a dataset stmSQL with a MANDATORY sp_executesql test
                         BEFORE saving (with and without dates).
 - ng_set_dataset_props : update whitelisted csNGAppWindowDataSets columns (pageSize,
@@ -93,6 +95,7 @@ from .ng_window import (
     ng_set_sort,
     ng_set_stmsql,
     ng_upsert_cols_group,
+    ng_upsert_tabs_group,
     update_view_html,
 )
 from .ng_lookups import ng_add_filter, ng_add_linked_window, ng_add_lookup, ng_create_lookup_window
