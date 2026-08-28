@@ -14,6 +14,7 @@ Konfiguracja (.env — plik jest w .gitignore, NIE commitować danych):
                                   https://myaccount.google.com/apppasswords)
 - MAIL_FROM_NAME                  opcjonalna nazwa nadawcy (display name)
 - MAIL_ALLOWED_RECIPIENT_DOMAINS  default: certusoft.pl (lista po przecinku)
+- MAIL_MAX_ATTACHMENT_MB          default: 20 (łączny rozmiar załączników)
 
 Bezpieczeństwo:
 - Narzędzie wysyła NAPRAWDĘ — agent może go użyć wyłącznie po akceptacji
@@ -25,11 +26,13 @@ Bezpieczeństwo:
 from __future__ import annotations
 
 import logging
+import mimetypes
 import os
 import re
 import smtplib
 from email.message import EmailMessage
 from email.utils import formataddr
+from pathlib import Path
 from typing import List, Optional, Sequence
 
 logger = logging.getLogger("mssql_mcp_server.mail")
@@ -61,6 +64,7 @@ def _cfg() -> dict:
             for d in os.environ.get("MAIL_ALLOWED_RECIPIENT_DOMAINS", "certusoft.pl").split(",")
             if d.strip()
         ],
+        "max_attachment_mb": float(os.environ.get("MAIL_MAX_ATTACHMENT_MB", "20")),
     }
 
 
@@ -98,6 +102,72 @@ def _check_domains(recipients: List[str], allowed: List[str]) -> None:
         )
 
 
+def _normalize_attachments(value, max_total_mb: float) -> List[Path]:
+    """Ścieżki plików → lista Path; waliduje istnienie i łączny rozmiar.
+
+    Walidacja PRZED połączeniem z SMTP — zły plik nie może skończyć się
+    mailem wysłanym bez załącznika.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        parts = [value]
+    elif isinstance(value, Sequence):
+        parts = list(value)
+    else:
+        raise ValueError(f"Nieprawidłowa lista załączników: {value!r}")
+
+    paths: List[Path] = []
+    total = 0
+    for p in parts:
+        p = str(p).strip()
+        if not p:
+            continue
+        path = Path(p)
+        if not path.is_absolute():
+            raise ValueError(
+                f"Załącznik musi mieć ścieżkę absolutną (dostałem {p!r}) — "
+                "serwer MCP ma inny katalog roboczy niż agent."
+            )
+        if not path.exists() or not path.is_file():
+            raise ValueError(f"Załącznik nie istnieje albo nie jest plikiem: {path}")
+        total += path.stat().st_size
+        paths.append(path)
+
+    limit = max_total_mb * 1024 * 1024
+    if total > limit:
+        raise ValueError(
+            f"Załączniki mają łącznie {total / 1024 / 1024:.1f} MB, limit to "
+            f"{max_total_mb:g} MB (MAIL_MAX_ATTACHMENT_MB w .env)."
+        )
+    return paths
+
+
+# Windows czyta typy MIME z rejestru i mapuje np. .csv na application/vnd.ms-excel —
+# dla tekstowych formatów wymuszamy sensowny typ, żeby klient pocztowy nie udawał Excela.
+_MIME_OVERRIDES = {
+    ".csv": "text/csv",
+    ".md": "text/markdown",
+    ".log": "text/plain",
+}
+
+
+def _attach(msg: EmailMessage, paths: List[Path]) -> None:
+    for path in paths:
+        ctype = _MIME_OVERRIDES.get(path.suffix.lower())
+        if ctype is None:
+            ctype, encoding = mimetypes.guess_type(path.name)
+            if ctype is None or encoding is not None:
+                ctype = "application/octet-stream"
+        maintype, subtype = ctype.split("/", 1)
+        msg.add_attachment(
+            path.read_bytes(),
+            maintype=maintype,
+            subtype=subtype,
+            filename=path.name,
+        )
+
+
 # ---------------------------------------------------------------------------
 # send_email
 # ---------------------------------------------------------------------------
@@ -108,6 +178,7 @@ def send_email(
     body: str,
     cc=None,
     html: Optional[str] = None,
+    attachments=None,
 ) -> str:
     cfg = _cfg()
 
@@ -121,6 +192,7 @@ def send_email(
         raise ValueError("Brak treści (parametr 'body').")
 
     _check_domains(to_list + cc_list, cfg["allowed_domains"])
+    attach_paths = _normalize_attachments(attachments, cfg["max_attachment_mb"])
 
     msg = EmailMessage()
     msg["From"] = formataddr((cfg["from_name"], cfg["user"])) if cfg["from_name"] else cfg["user"]
@@ -131,10 +203,13 @@ def send_email(
     msg.set_content(body)
     if html and html.strip():
         msg.add_alternative(html, subtype="html")
+    # add_attachment po add_alternative sam przełącza kopertę na multipart/mixed.
+    _attach(msg, attach_paths)
 
     logger.info(
-        "Sending e-mail: to=%s cc=%s subject=%r via %s:%s as %s",
-        to_list, cc_list, subject.strip(), cfg["host"], cfg["port"], cfg["user"],
+        "Sending e-mail: to=%s cc=%s subject=%r attachments=%s via %s:%s as %s",
+        to_list, cc_list, subject.strip(), [p.name for p in attach_paths],
+        cfg["host"], cfg["port"], cfg["user"],
     )
 
     if cfg["port"] == 587:
@@ -153,6 +228,12 @@ def send_email(
         f"  To: {', '.join(to_list)}\n"
         + (f"  Cc: {', '.join(cc_list)}\n" if cc_list else "")
         + f"  Subject: {subject.strip()}"
+        + (
+            "\n  Załączniki: "
+            + ", ".join(f"{p.name} ({p.stat().st_size / 1024:.0f} kB)" for p in attach_paths)
+            if attach_paths
+            else ""
+        )
     )
 
 
@@ -175,6 +256,7 @@ def tool_descriptors():
                 "Send a REAL e-mail via SMTP from the account configured in .env "
                 "(MAIL_USER, Gmail App Password). Recipients restricted to "
                 "MAIL_ALLOWED_RECIPIENT_DOMAINS (default certusoft.pl). "
+                "Supports file attachments via 'attachments' (absolute paths). "
                 "Use ONLY after the user explicitly approved the exact content."
             ),
             inputSchema={
@@ -197,6 +279,18 @@ def tool_descriptors():
                         ],
                     },
                     "html": {"type": "string", "description": "Optional HTML alternative body."},
+                    "attachments": {
+                        "description": (
+                            "Optional file attachment(s): ABSOLUTE path as string, or array of "
+                            "absolute paths. MIME type is guessed from the extension; total size "
+                            "limited by MAIL_MAX_ATTACHMENT_MB (default 20 MB). A missing file or "
+                            "a relative path is rejected BEFORE anything is sent."
+                        ),
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ],
+                    },
                 },
                 "required": ["to", "subject", "body"],
             },
@@ -215,6 +309,7 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             body=arguments.get("body", ""),
             cc=arguments.get("cc"),
             html=arguments.get("html"),
+            attachments=arguments.get("attachments"),
         )
 
     raise ValueError(f"Unknown mail tool: {name}")
