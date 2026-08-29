@@ -351,6 +351,15 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
         "hard_readonly": True,  # żywy preprod Platona — na czas diagnozy tylko odczyt; zdejmij gdy uzgodniony fix do wdrożenia
         "hint": "Platon PREPROD (CS-BCKP02\\PLATON/test05) — baza za portalem m-platon.test-certusoft.pl. READ-ONLY na twardo (diagnostyka wyszukiwarki B2B/Typesense). Definicje okien Platona żyją tu, nie na DEV cs.",
     },
+    "GRODNOFR": {
+        "server": r"CS-SQL01\GRODNO",
+        "database": "GrodnoFranczyza01",
+        "user_env": "CSGRODNOFR_USER",
+        "user": "adminjmk",  # fallback gdy CSGRODNOFR_USER nieustawiony
+        "password_env": ("CSGRODNOFR_PWD", "CSSQL01_PWD"),  # ten sam host co profil CSSQL01 — domyślnie to samo hasło adminjmk
+        "hard_readonly": False,
+        "hint": "Grodno Franczyza (CS-SQL01\\GRODNO/GrodnoFranczyza01) — osobna instalacja cs* za portalem b2b-grodno-hr.certusoft.pl (connection 'prod-hr': firma C3BA5ED7…, portal 7B367487…). Zapis wymaga allow_write=true.",
+    },
 }
 
 _WRITE_TOKEN_RE = re.compile(
@@ -1015,7 +1024,8 @@ async def list_tools() -> List[Tool]:
                 "CERES_TEST (CERTUSOFT-SQL-T/test13 — klient Ceres), PBS (CS-SQL03\\PBS/csPBS — PRODUKCJA instalacji PBS), "
                 "SLGRODNO (CS-BCKP01\\GRODNO/sl_grodno — baza spoza modelu cs*), "
                 "PBSTEST (CS-BCKP01\\PBS/testPBS — TESTOWA instalacja PBS), "
-                "PLATONPRE (CS-BCKP02\\PLATON/test05 — PREPROD Platona, baza za m-platon.test-certusoft.pl, READ-ONLY na twardo). "
+                "PLATONPRE (CS-BCKP02\\PLATON/test05 — PREPROD Platona, baza za m-platon.test-certusoft.pl, READ-ONLY na twardo), "
+                "GRODNOFR (CS-SQL01\\GRODNO/GrodnoFranczyza01 — instalacja Grodno Franczyza za b2b-grodno-hr.certusoft.pl). "
                 "Non-DEV profiles are READ-ONLY by default: insert/update/delete/exec/DDL are rejected unless "
                 "allow_write=true. Schema changes on PRODUCTION profiles (PROD, PBS) are BLOCKED regardless "
                 "of allow_write/allow_raw_ddl — permanent create/alter/drop and select-into are rejected "
@@ -1030,7 +1040,7 @@ async def list_tools() -> List[Tool]:
                     },
                     "server": {
                         "type": "string",
-                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO", "PBS", "PBSTEST", "PLATONPRE"],
+                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO", "PBS", "PBSTEST", "PLATONPRE", "GRODNOFR"],
                         "description": "Target environment (default DEV)."
                     },
                     "allow_write": {
