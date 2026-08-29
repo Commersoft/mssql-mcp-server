@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `repl_apply_pending` (2026-08-29, `cs_tools/repl_queue.py`)
+Kolejka replikacji konfiguracji **u klienta** (`csReplConfigChangesClientLog` — ramki „Up to a date” z DEV), z parametrem `server`:
+
+- `action=status` (read-only): liczniki `Status -1/0/1` z datami, wiersze błędne (`ProcessError`), blokady `blockFurtherRows`, zaległe wg `Opr` i obiektu, pierwsze N zaległych (`object_like` zawęża — „czy moja procedura już czeka w kolejce?”), joby `csCompaniesJobs *ClientLog*` z ostrzeżeniem przy `ApplyJob Active=0` (Grodno PROD od 01.2026 — backlog rośnie do ręcznego startu), joby msdb `ApplyBackground` (nieudane nie kasują się same), ostatnie próby z `…Execution`.
+- `action=start`: uruchamia backlog w tle przez `csReplConfigChangesClientLogApplyBackground` z **`sp_set_session_context 'csUsrId'` w tej samej sesji** (proc czyta użytkownika przez `csSysFnUsrId()`; bez kontekstu `@csUsrId` = NULL, `concat()` gubi wartość i krok joba pada „Incorrect syntax near ','”). Użytkownik po `usr_login`/`cs_usr_id`, firma auto z jedynej firmy posiadającej `ApplyJob`/`ImportJob` (nie `ExportJob` — ten jest też u źródła). Odmawia, gdy kolejka czysta albo job już biegnie (wyścig na jednej kolejce); `dry_run` pokazuje batch.
+- `action=progress`: job msdb (stan/`sysjobhistory`), próby z `csReplConfigChangesClientLogExecution` w oknie `since_minutes`, tempo z ostatnich 200 prób, bieżący `LogId`, ETA; osierocone wiersze bez `StopDate` (padnięta sesja) oznaczone jako NIE-praca-w-toku.
+- Pułapki zaszyte: kolumny `xml` przez `convert(nvarchar(max))` (`nvarchar(N)` rzuca „Target string size is too small”), `@value` `sql_variant` bindowane przez zadeklarowaną zmienną, `nextset()` do ostatniego result setu po `sp_start_job`.
+- `server.py`: każde narzędzie z `MULTI_SERVER_TOOLS` dostaje teraz `_target_label` (dotąd tylko `CROSS_SERVER_TOOLS`).
+
 ### Added — cs* write/automation tools (`cs_tools.py`)
 Narzędzia kapsułkujące niejawne reguły frameworku cs* (egzekwowane programowo zamiast „z pamięci agenta"):
 

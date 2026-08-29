@@ -25,6 +25,7 @@ from .discovery import describe, ng_diff_with_dict, ng_preview_dataset, sql_grep
 from .replicate import ng_replicate_window
 from .help_tools import help_upsert_topic
 from .ai_tools import ai_tool_register, ai_tool_sync_params
+from .repl_queue import repl_apply_pending
 
 
 CS_TOOL_NAMES = {
@@ -62,6 +63,7 @@ CS_TOOL_NAMES = {
     "ai_tool_register",
     "ng_create_lookup_window",
     "ng_replicate_window",
+    "repl_apply_pending",
 }
 
 
@@ -952,6 +954,38 @@ def tool_descriptors():
                 "required": ["app_window_ident", "server"],
             },
         ),
+        Tool(
+            name="repl_apply_pending",
+            description=(
+                "Kolejka replikacji konfiguracji U KLIENTA (csReplConfigChangesClientLog — ramki 'Up to a date' "
+                "z DEV: wersje procedur V, wiersze konfiguracji I/U/D, exec E). action='status' (default, read-only): "
+                "liczniki Status -1/0/1, błędy -1 z ProcessError, blokady blockFurtherRows, zaległe wg Opr/obiektu, "
+                "pierwsze N zaległych (object_like zawęża), joby csCompaniesJobs (ostrzega gdy ApplyJob Active=0), "
+                "joby msdb ApplyBackground, ostatnie próby. action='start': uruchamia backlog W TLE przez "
+                "csReplConfigChangesClientLogApplyBackground z sp_set_session_context 'csUsrId' w tej samej sesji "
+                "(bez tego job pada 'Incorrect syntax near ,'); odmawia gdy job już biegnie lub kolejka czysta; "
+                "dry_run pokazuje co wykona. action='progress': job msdb, próby z csReplConfigChangesClientLogExecution "
+                "w oknie since_minutes, tempo, bieżący LogId, szacowany czas do końca. Zanim ręcznie przeniesiesz obiekt "
+                "na PROD (deploy_sql_object server=PROD / JSONSave) — sprawdź status: najpewniej już czeka w kolejce. "
+                "Na DEV kolejka klienta nie ma zastosowania (użyj server=PROD/TESTGRODNO/…)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["status", "start", "progress"], "description": "Default status."},
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "PBS", "PBSTEST", "PLATONPRE"],
+                               "description": "Target environment (default DEV — bez sensu dla start; kolejka klienta = PROD/TESTGRODNO/PLAY/…)."},
+                    "usr_login": {"type": "string", "description": "start: login csUsr, którego csUsrId trafi do session_context (np. 'jmk'). Alternatywa: cs_usr_id."},
+                    "cs_usr_id": {"type": "integer", "description": "start: csUsrId wprost (zamiast usr_login)."},
+                    "cs_companies_id": {"type": "integer", "description": "start: firma instalacji; default = jedyna firma z jobami *ReplConfigChangesClientLog* w csCompaniesJobs."},
+                    "object_like": {"type": "string", "description": "status: filtr ObjectName like '%x%' dla listy zaległych (np. 'csAIAgentsTools' albo nazwa procedury)."},
+                    "top": {"type": "integer", "description": "status: ile pierwszych zaległych wypisać (default 20)."},
+                    "since_minutes": {"type": "integer", "description": "progress: okno prób instalacji do tempa (default 60)."},
+                    "dry_run": {"type": "boolean", "description": "start: tylko raport + komendy, bez uruchomienia."},
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -1375,6 +1409,20 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             visible_fields=arguments.get("visible_fields"),
             run_validator=bool(arguments.get("run_validator", True)),
             namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "repl_apply_pending":
+        return repl_apply_pending(
+            connection_string,
+            action=arguments.get("action") or "status",
+            usr_login=arguments.get("usr_login"),
+            cs_usr_id=int(arguments["cs_usr_id"]) if arguments.get("cs_usr_id") is not None else None,
+            cs_companies_id=int(arguments["cs_companies_id"]) if arguments.get("cs_companies_id") is not None else None,
+            object_like=arguments.get("object_like"),
+            top=int(arguments.get("top") or 20),
+            since_minutes=int(arguments.get("since_minutes") or 60),
+            dry_run=bool(arguments.get("dry_run", False)),
+            target_label=arguments.get("_target_label") or "DEV",
         )
 
     raise ValueError(f"Unknown cs tool: {name}")

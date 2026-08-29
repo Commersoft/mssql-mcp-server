@@ -55,8 +55,13 @@ Tools:
 - ng_replicate_window : replicate the FULL config of an NG window DEV -> target (server=PROD)
                         with the DEV G on every row (HARD RULE 24); replaces the manual
                         batch-replay + '~' trick; prune=drift repair, dry_run supported.
+- repl_apply_pending  : client-side replication queue (csReplConfigChangesClientLog):
+                        status (Status -1/0/1, errors, blocks, jobs Active), start the backlog
+                        in background (ApplyBackground + sp_set_session_context csUsrId in the
+                        same session), progress (Execution rows, msdb job, rate, ETA). server=PROD/…
 
-All tools are WRITE-CAPABLE (except describe/sql_grep/ng_preview_dataset — read-only). They run against the same connection_string as the
+All tools are WRITE-CAPABLE (except describe/sql_grep/ng_preview_dataset and
+repl_apply_pending(action=status|progress) — read-only). They run against the same connection_string as the
 read tools. Destructive safety: deploy_sql_object never drops unless csAddObjVer
 returns @drop=1; orphan cleanup only flips inProgress=0 (never DELETE).
 """
@@ -112,5 +117,6 @@ from .replicate import (
 )
 from .help_tools import _help_content_replace, help_upsert_topic
 from .ai_tools import ai_tool_register, ai_tool_sync_params
+from .repl_queue import repl_apply_pending
 from .registry import CS_TOOL_NAMES, handle_tool, tool_descriptors
 from ._core import logger
