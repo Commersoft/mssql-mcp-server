@@ -19,15 +19,17 @@ from ._core import DEFAULT_NAMESPACE_G, _exec_scalar, _jsonsave
 # would freeze stale JSON (csNGAppWindows.dataSets / linkedWindows, DataSets.fields).
 _REPLICATE_TABLES = (
     ("csNGAppWindows", {"dataSets", "linkedWindows"}),
+    ("csNGAppWindowColsGroups", set()),
     ("csNGAppWindowDataSets", {"fields"}),
     ("csNGAppWindowDataSetsFields", set()),
     ("csNGAppWindowDataSetsKeyFields", set()),
     ("csNGAppWindowDataSetsLayouts", set()),
     ("csNGAppWindowDataSetsLayoutsCols", set()),
+    # SortOrder has FKs to both the layout column and SortIdents.
+    ("csNGAppWindowDataSetsSortIdents", set()),
     ("csNGAppWindowDataSetsLayoutsColsSortOrder", set()),
     ("csNGAppWindowDataSetsLayoutsAggrs", set()),
     ("csNGAppWindowDataSetsLayoutsRows", set()),
-    ("csNGAppWindowDataSetsSortIdents", set()),
     ("csNGAppWindowDataSetsPageSizesIdents", set()),
     ("csNGAppWindowDataSetsWhereFields", set()),
     ("csNGAppWindowDataSetsActions", set()),
@@ -40,7 +42,6 @@ _REPLICATE_TABLES = (
     ("csNGAppWindowDataSetsLookupDefsSortIdents", set()),
     ("csNGAppWindowDataSetsExports", set()),
     ("csNGAppWindowDataSetsImports", set()),
-    ("csNGAppWindowColsGroups", set()),
     ("csNGAppWindowTranslates", set()),
     ("csNGAppWindowsPrivileges", set()),
     ("csHelpContentsNGAppWindows", set()),

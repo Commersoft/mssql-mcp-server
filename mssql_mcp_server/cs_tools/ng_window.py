@@ -920,8 +920,8 @@ def ng_upsert_tabs_group(
 
 STMSQL_TEST_PARAMS_DECL = (
     "@stmSQLOut nvarchar(max) out, @ch nvarchar(2), @csCompaniesIdStr nvarchar(30), "
-    "@isRefreshOneRecord int, @LanguageSuffix nvarchar(2), @where nvarchar(max), "
-    "@whereLists nvarchar(max)"
+    "@csCompaniesId bigint, @csUsrId bigint, @isRefreshOneRecord int, "
+    "@LanguageSuffix nvarchar(2), @where nvarchar(max), @whereLists nvarchar(max)"
 )
 
 
@@ -929,10 +929,14 @@ def _test_stmsql(cur, stm: str, where_json: str) -> Optional[str]:
     """Run the stmSQL template through sp_executesql; return error text or None on success."""
     try:
         cur.execute(
-            "declare @stmSQLOut nvarchar(max) = N''; "
+            "declare @stmSQLOut nvarchar(max) = N'', @testUsrId bigint; "
+            "select top 1 @testUsrId = cu.csUsrId "
+            "from dbo.csCompaniesUsrs cu with(nolock) "
+            "where cu.csCompaniesId = 1435126 order by cu.csUsrId; "
             "exec sp_executesql @stmt = ?, @params = N'" + STMSQL_TEST_PARAMS_DECL + "', "
             "@stmSQLOut = @stmSQLOut out, @ch = ?, @csCompaniesIdStr = N'1435126', "
-            "@isRefreshOneRecord = 0, @LanguageSuffix = N'PL', @where = ?, @whereLists = N'{}'; "
+            "@csCompaniesId = 1435126, @csUsrId = @testUsrId, @isRefreshOneRecord = 0, "
+            "@LanguageSuffix = N'PL', @where = ?, @whereLists = N'{}'; "
             "select @stmSQLOut;",
             stm, "\r\n", where_json,
         )
