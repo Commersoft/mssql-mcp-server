@@ -356,9 +356,10 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
         "database": "GrodnoFranczyza01",
         "user_env": "CSGRODNOFR_USER",
         "user": "adminjmk",  # fallback gdy CSGRODNOFR_USER nieustawiony
-        "password_env": ("CSGRODNOFR_PWD", "CSSQL01_PWD"),  # ten sam host co profil CSSQL01 — domyślnie to samo hasło adminjmk
+        "password_env": ("CSGRODNOFR_PWD", "CSSQL01_PWD"),  # inna instancja niż CSSQL01\CS — hasło adminjmk bywa inne, fallback często NIE zaloguje
         "hard_readonly": False,
-        "hint": "Grodno Franczyza (CS-SQL01\\GRODNO/GrodnoFranczyza01) — osobna instalacja cs* za portalem b2b-grodno-hr.certusoft.pl (connection 'prod-hr': firma C3BA5ED7…, portal 7B367487…). Zapis wymaga allow_write=true.",
+        "is_production": True,
+        "hint": "PRODUKCJA instalacji Grodno Franczyza (CS-SQL01\\GRODNO/GrodnoFranczyza01) — osobna instalacja cs* za portalem b2b-grodno-hr.certusoft.pl (connection 'prod-hr': firma C3BA5ED7…, portal 7B367487…). Zapis wymaga allow_write=true; zmiany struktury/kodu wyłącznie pakietami csSysChanges, dane przez <T>JSONSave.",
     },
 }
 
@@ -1025,9 +1026,9 @@ async def list_tools() -> List[Tool]:
                 "SLGRODNO (CS-BCKP01\\GRODNO/sl_grodno — baza spoza modelu cs*), "
                 "PBSTEST (CS-BCKP01\\PBS/testPBS — TESTOWA instalacja PBS), "
                 "PLATONPRE (CS-BCKP02\\PLATON/test05 — PREPROD Platona, baza za m-platon.test-certusoft.pl, READ-ONLY na twardo), "
-                "GRODNOFR (CS-SQL01\\GRODNO/GrodnoFranczyza01 — instalacja Grodno Franczyza za b2b-grodno-hr.certusoft.pl). "
+                "GRODNOFR (CS-SQL01\\GRODNO/GrodnoFranczyza01 — PRODUKCJA instalacji Grodno Franczyza za b2b-grodno-hr.certusoft.pl). "
                 "Non-DEV profiles are READ-ONLY by default: insert/update/delete/exec/DDL are rejected unless "
-                "allow_write=true. Schema changes on PRODUCTION profiles (PROD, PBS) are BLOCKED regardless "
+                "allow_write=true. Schema changes on PRODUCTION profiles (PROD, PBS, GRODNOFR) are BLOCKED regardless "
                 "of allow_write/allow_raw_ddl — permanent create/alter/drop and select-into are rejected "
                 "(structure: csSysChanges packages; code objects: deploy_sql_object); temp objects (#...) allowed."
             ),
