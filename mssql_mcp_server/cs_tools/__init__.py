@@ -28,6 +28,8 @@ Tools:
 - ng_set_layout_col   : upsert grid layout col props (width/isVisible/ord/colsGroupIdent)
                         via minimal-U (no natural key -> no label re-validation trap).
 - ng_upsert_cols_group : upsert a grid column group (csNGAppWindowColsGroups).
+- ng_upsert_tabs_group : upsert a tabs group of linked windows (csNGAppWindowTabsGroups,
+                        per master window) + optionally attach links (tabGroupIdent).
 - ng_set_stmsql       : replace a dataset stmSQL with a MANDATORY sp_executesql test
                         BEFORE saving (with and without dates).
 - ng_set_dataset_props : update whitelisted csNGAppWindowDataSets columns (pageSize,
@@ -53,8 +55,13 @@ Tools:
 - ng_replicate_window : replicate the FULL config of an NG window DEV -> target (server=PROD)
                         with the DEV G on every row (HARD RULE 24); replaces the manual
                         batch-replay + '~' trick; prune=drift repair, dry_run supported.
+- repl_apply_pending  : client-side replication queue (csReplConfigChangesClientLog):
+                        status (Status -1/0/1, errors, blocks, jobs Active), start the backlog
+                        in background (ApplyBackground + sp_set_session_context csUsrId in the
+                        same session), progress (Execution rows, msdb job, rate, ETA). server=PROD/…
 
-All tools are WRITE-CAPABLE (except describe/sql_grep/ng_preview_dataset — read-only). They run against the same connection_string as the
+All tools are WRITE-CAPABLE (except describe/sql_grep/ng_preview_dataset and
+repl_apply_pending(action=status|progress) — read-only). They run against the same connection_string as the
 read tools. Destructive safety: deploy_sql_object never drops unless csAddObjVer
 returns @drop=1; orphan cleanup only flips inProgress=0 (never DELETE).
 """
@@ -93,6 +100,7 @@ from .ng_window import (
     ng_set_sort,
     ng_set_stmsql,
     ng_upsert_cols_group,
+    ng_upsert_tabs_group,
     update_view_html,
 )
 from .ng_lookups import ng_add_filter, ng_add_linked_window, ng_add_lookup, ng_create_lookup_window
@@ -109,5 +117,6 @@ from .replicate import (
 )
 from .help_tools import _help_content_replace, help_upsert_topic
 from .ai_tools import ai_tool_register, ai_tool_sync_params
+from .repl_queue import repl_apply_pending
 from .registry import CS_TOOL_NAMES, handle_tool, tool_descriptors
 from ._core import logger

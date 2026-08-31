@@ -259,9 +259,11 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
     "PROD": {
         "server": "cs-sql03",
         "database": "cs04",
-        "user": "adminjmk",
+        "user_env": "CSPROD_USER",
+        "user": "adminjmk",  # fallback when CSPROD_USER is not set
         "password_env": "CSPROD_PWD",
         "hard_readonly": False,
+        "is_production": True,
         "hint": "PROD Grodno (cs-sql03/cs04). Zmiany danych tylko przez pakiety csSysChanges!",
     },
     "PLAY": {
@@ -283,7 +285,8 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
     "CSSQL01": {
         "server": r"cs-sql01\cs",
         "database": "cs",
-        "user": "adminjmk",
+        "user_env": "CSSQL01_USER",
+        "user": "adminjmk",  # fallback gdy CSSQL01_USER nieustawiony
         "password_env": "CSSQL01_PWD",
         "hard_readonly": False,
         "hint": "cs-sql01\\cs (czas pracy). CustomerDesc/ProjectDesc, nie Desc_PL.",
@@ -291,7 +294,8 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
     "SAVPOL": {
         "server": r"CS-SQL02\SAVPOL",
         "database": "cs06",
-        "user": "adminjmk",
+        "user_env": "CSSAVPOL_USER",
+        "user": "adminjmk",  # fallback gdy CSSAVPOL_USER nieustawiony
         "password_env": "CSSAVPOL_PWD",
         "hard_readonly": False,
         "hint": "Środowisko klienta Savpol. Hasło podaje user per-sesja (env CSSAVPOL_PWD).",
@@ -299,18 +303,63 @@ SERVER_PROFILES: Dict[str, Dict[str, Any]] = {
     "TESTGRODNO": {
         "server": r"CS-BCKP01\GRODNO",
         "database": "test04",
-        "user_env": "CSTESTGRODNO_USER",
-        "password_env": "CSTESTGRODNO_PWD",
+        # ten sam serwer co SLGRODNO — jeśli nie ma osobnych creds, bierz tamte
+        "user_env": ("CSTESTGRODNO_USER", "CSSLGRODNO_USER"),
+        "password_env": ("CSTESTGRODNO_PWD", "CSSLGRODNO_PWD"),
         "hard_readonly": False,
         "hint": "Baza testowa Grodno (kopia PROD). Zapis wymaga allow_write=true (odblokowane 2026-07-16 dla testów wyszukiwarki).",
     },
     "CERES_TEST": {
-        "server": "172.19.1.10",
+        "server": "CERES_TEST",
         "database": "test13",
         "user_env": "CSCERESTEST_USER",
         "password_env": "CSCERESTEST_PWD",
         "hard_readonly": False,
         "hint": "Ceres TEST (CERTUSOFT-SQL-T/test13) — klient Ceres, projekt VueCeres. Zapis wymaga allow_write=true.",
+    },
+    "SLGRODNO": {
+        "server": r"CS-BCKP01\GRODNO",
+        "database": "sl_grodno",
+        # ten sam serwer co TESTGRODNO — jeśli nie ma osobnych creds, bierz tamte
+        "user_env": ("CSSLGRODNO_USER", "CSTESTGRODNO_USER"),
+        "password_env": ("CSSLGRODNO_PWD", "CSTESTGRODNO_PWD"),
+        "hard_readonly": False,
+        "hint": "Baza sl_grodno na CS-BCKP01\\GRODNO — POZA modelem cs* (brak <T>JSONSave/csSysChanges). Zapis wymaga allow_write=true.",
+    },
+    "PBS": {
+        "server": r"CS-SQL03\PBS",
+        "database": "csPBS",
+        "user_env": "CSPBS_USER",
+        "password_env": "CSPBS_PWD",
+        "hard_readonly": False,
+        "is_production": True,
+        "hint": "PRODUKCJA instalacji PBS (CS-SQL03\\PBS/csPBS) — osobna instancja, jedyna baza cs* to csPBS. Zmiany struktury/kodu wyłącznie pakietami csSysChanges; dane tylko przez <T>JSONSave.",
+    },
+    "PBSTEST": {
+        "server": r"CS-BCKP01\PBS",
+        "database": "testPBS",
+        "user_env": "CSPBSTEST_USER",
+        "password_env": "CSPBSTEST_PWD",
+        "hard_readonly": False,
+        "hint": "TESTOWA instalacja PBS (CS-BCKP01\\PBS/testPBS) — środowisko prób przed csPBS. Po stronie Softlaba podpięta do 10.20.10.46/UAT_PBSC_MG — ta baza NIE ma tu profilu (inny model danych, osobny serwer MCP z repo pbs-softlab). Zapis wymaga allow_write=true.",
+    },
+    "PLATONPRE": {
+        "server": r"CS-BCKP02\PLATON",
+        "database": "test05",
+        "user": "admindst",
+        "password_env": "CSPLATONPRE_PWD",
+        "hard_readonly": True,  # żywy preprod Platona — na czas diagnozy tylko odczyt; zdejmij gdy uzgodniony fix do wdrożenia
+        "hint": "Platon PREPROD (CS-BCKP02\\PLATON/test05) — baza za portalem m-platon.test-certusoft.pl. READ-ONLY na twardo (diagnostyka wyszukiwarki B2B/Typesense). Definicje okien Platona żyją tu, nie na DEV cs.",
+    },
+    "GRODNOFR": {
+        "server": r"CS-SQL01\GRODNO",
+        "database": "GrodnoFranczyza01",
+        "user_env": "CSGRODNOFR_USER",
+        "user": "adminjmk",  # fallback gdy CSGRODNOFR_USER nieustawiony
+        "password_env": ("CSGRODNOFR_PWD", "CSSQL01_PWD"),  # inna instancja niż CSSQL01\CS — hasło adminjmk bywa inne, fallback często NIE zaloguje
+        "hard_readonly": False,
+        "is_production": True,
+        "hint": "PRODUKCJA instalacji Grodno Franczyza (CS-SQL01\\GRODNO/GrodnoFranczyza01) — osobna instalacja cs* za portalem b2b-grodno-hr.certusoft.pl (connection 'prod-hr': firma C3BA5ED7…, portal 7B367487…). Zapis wymaga allow_write=true; zmiany struktury/kodu wyłącznie pakietami csSysChanges, dane przez <T>JSONSave.",
     },
 }
 
@@ -358,6 +407,41 @@ def find_write_token(sql: str) -> Optional[str]:
     return m.group(1).lower() if m else None
 
 
+# Guard: schema changes on PRODUCTION profiles (is_production: True) — blocked regardless
+# of allow_write/allow_raw_ddl. Sanctioned paths: csSysChanges packages (structure) and
+# deploy_sql_object (code objects, consistent version chain). Temp objects (#...) stay
+# allowed — diagnostics on PROD legitimately build #temp tables (they still need
+# allow_write=true because of the 'create' write token).
+_SCHEMA_DDL_RE = re.compile(
+    r"(?is)\b(create|alter|drop)\s+(or\s+alter\s+)?"
+    r"(procedure|proc|function|view|trigger|table|index|schema|type|sequence|synonym|database|role|user|login)\b"
+)
+
+
+def find_production_ddl(sql: str) -> Optional[str]:
+    """Return a short label ('alter table', 'select into', ...) when the statement changes
+    the schema of a PERMANENT object; None for temp-only DDL (#tables, indexes on #tables)."""
+    stripped = _strip_sql_literals_and_comments(sql)
+    for m in _SCHEMA_DDL_RE.finditer(stripped):
+        verb, obj = m.group(1).lower(), m.group(3).lower()
+        tail = stripped[m.end():].lstrip()
+        if obj == "table" and tail.startswith(("#", "[#")):
+            continue  # create/alter/drop table #tmp
+        if obj == "index" and re.match(r"(?is)\[?\w+\]?\s+on\s+\[?#", tail):
+            continue  # create/drop index ... on #tmp
+        return f"{verb} {obj}"
+    # select ... into <permanent> tworzy tabelę bez słowa 'create'
+    for m in re.finditer(r"(?is)\binto\s+(.{0,2})", stripped):
+        before = stripped[:m.start()].rstrip().lower()
+        if before.endswith(("insert", "merge")):
+            continue  # insert/merge into = DML, nie DDL
+        head = m.group(1)
+        if "#" in head or head.startswith("@"):
+            continue  # select into #tmp / fetch into @var
+        return "select into (creates a permanent table)"
+    return None
+
+
 # Guard: create/alter of a MANAGED cs* code object outside the csAddObjVer framework.
 # Searched on the RAW query (including string literals) — catches also the
 # sp_executesql/replace('create procedure','alter procedure') hotfix path that
@@ -372,6 +456,7 @@ MULTI_SERVER_TOOLS = {
     "describe", "sql_grep", "get_cs_object_versions", "rebuild_user_rights",
     "register_job", "rag_get_sql_object", "deploy_sql_object",
     "ng_replicate_window", "ng_ensure_privileges", "help_upsert_topic", "ng_preview_dataset",
+    "repl_apply_pending",
 }
 
 # tools that additionally need the DEV connection (cross-server: DEV = source of truth)
@@ -411,7 +496,12 @@ def _reload_env_file() -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+            v = v.strip()
+            # cudzysłowy z .env (CSSQL01_USER="adminjmk") muszą zlecieć — inaczej idą
+            # do connection stringu i login pada 18456 (incydent 2026-08-22)
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                v = v[1:-1]
+            os.environ.setdefault(k.strip(), v)
 
 
 def _getenv_reloading(name: str) -> Optional[str]:
@@ -421,6 +511,24 @@ def _getenv_reloading(name: str) -> Optional[str]:
         _reload_env_file()
         val = os.getenv(name)
     return val
+
+
+def _env_name_list(spec) -> List[str]:
+    """Profile creds may name one env var or a fallback chain (tuple/list)."""
+    return [spec] if isinstance(spec, str) else list(spec)
+
+
+def _first_env(spec) -> Optional[str]:
+    """First non-empty value from the profile's env-var chain."""
+    for name in _env_name_list(spec):
+        val = _getenv_reloading(name)
+        if val:
+            return val
+    return None
+
+
+def _env_names(spec) -> str:
+    return " / ".join(_env_name_list(spec))
 
 
 def resolve_profile_connection(profile_name: str) -> Tuple[str, str]:
@@ -436,16 +544,19 @@ def resolve_profile_connection(profile_name: str) -> Tuple[str, str]:
     server = prof["server"] or dev_config["server"]
     database = prof["database"]
     if prof.get("user_env"):
-        user = _getenv_reloading(prof["user_env"])
+        # env wygrywa nad wpisem w profilu; brak obu = błąd z podpowiedzią, którą zmienną ustawić
+        user = _first_env(prof["user_env"]) or prof.get("user")
         if not user:
-            raise ValueError(f"Profile {profile_name}: set env {prof['user_env']} (user).")
+            raise ValueError(
+                f"Profile {profile_name}: set env {_env_names(prof['user_env'])} (user)."
+            )
     else:
         user = prof["user"] or os.getenv("MSSQL_USER")
     if prof.get("password_env"):
-        password = _getenv_reloading(prof["password_env"])
+        password = _first_env(prof["password_env"])
         if not password:
             raise ValueError(
-                f"Profile {profile_name}: missing env {prof['password_env']} (password). "
+                f"Profile {profile_name}: missing env {_env_names(prof['password_env'])} (password). "
                 f"Poproś użytkownika o hasło / ustaw w mssql-mcp-server/.env."
             )
     else:
@@ -911,9 +1022,15 @@ async def list_tools() -> List[Tool]:
                 "Execute an SQL query (REQUIRED param: query — NOT 'sql'). Default target = DEV (from .env). Optional `server` targets a named "
                 "profile: PROD (cs-sql03/cs04 — Grodno), PLAY (csPlay), LOT (csLot), CSSQL01 (cs-sql01\\cs — czas pracy), "
                 "SAVPOL (CS-SQL02\\SAVPOL/cs06), TESTGRODNO (CS-BCKP01\\GRODNO/test04 — kopia PROD do testów), "
-                "CERES_TEST (CERTUSOFT-SQL-T/test13 — klient Ceres). "
+                "CERES_TEST (CERTUSOFT-SQL-T/test13 — klient Ceres), PBS (CS-SQL03\\PBS/csPBS — PRODUKCJA instalacji PBS), "
+                "SLGRODNO (CS-BCKP01\\GRODNO/sl_grodno — baza spoza modelu cs*), "
+                "PBSTEST (CS-BCKP01\\PBS/testPBS — TESTOWA instalacja PBS), "
+                "PLATONPRE (CS-BCKP02\\PLATON/test05 — PREPROD Platona, baza za m-platon.test-certusoft.pl, READ-ONLY na twardo), "
+                "GRODNOFR (CS-SQL01\\GRODNO/GrodnoFranczyza01 — PRODUKCJA instalacji Grodno Franczyza za b2b-grodno-hr.certusoft.pl). "
                 "Non-DEV profiles are READ-ONLY by default: insert/update/delete/exec/DDL are rejected unless "
-                "allow_write=true. Schema changes on PROD are forbidden regardless (use csSysChanges packages)."
+                "allow_write=true. Schema changes on PRODUCTION profiles (PROD, PBS, GRODNOFR) are BLOCKED regardless "
+                "of allow_write/allow_raw_ddl — permanent create/alter/drop and select-into are rejected "
+                "(structure: csSysChanges packages; code objects: deploy_sql_object); temp objects (#...) allowed."
             ),
             inputSchema={
                 "type": "object",
@@ -924,7 +1041,7 @@ async def list_tools() -> List[Tool]:
                     },
                     "server": {
                         "type": "string",
-                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
+                        "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO", "PBS", "PBSTEST", "PLATONPRE", "GRODNOFR"],
                         "description": "Target environment (default DEV)."
                     },
                     "allow_write": {
@@ -964,10 +1081,11 @@ def _resolve_tool_connection(name: str, arguments: dict) -> Tuple[str, str]:
             )
         target_conn, label = resolve_profile_connection(profile)
         header = f"-- server: {profile} ({label}) --\n"
+        # every multi-server tool may label its output with the target profile
+        arguments["_target_label"] = profile
         if name in CROSS_SERVER_TOOLS:
             # cross-server: target conn + DEV conn (DEV = source of truth)
             arguments["_dev_connection_string"] = connection_string
-            arguments["_target_label"] = profile
         connection_string = target_conn
     return connection_string, header
 
@@ -1042,6 +1160,15 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
                     f"Error: profile {profile_name} is ALWAYS read-only (statement contains '{token}'). "
                     f"{prof.get('hint', '')}"
                 ))]
+            if prof.get("is_production"):
+                ddl = find_production_ddl(query)
+                if ddl:
+                    return [TextContent(type="text", text=(
+                        f"Error: profile {profile_name} is PRODUCTION — schema changes ('{ddl}') are "
+                        f"blocked regardless of allow_write/allow_raw_ddl. Structure changes go through "
+                        f"csSysChanges packages, code objects through deploy_sql_object; temp objects "
+                        f"(#...) are allowed. {prof.get('hint', '')}"
+                    ))]
             if token and not allow_write:
                 return [TextContent(type="text", text=(
                     f"Error: profile {profile_name} is read-only by default and the statement contains "
@@ -1080,7 +1207,9 @@ async def main():
             with conn.cursor() as cursor:
                 cursor.execute("SELECT @@VERSION")
                 version = cursor.fetchone()[0]
-                logger.info(f"Connected to SQL Server: {version.split('\\n')[0]}")
+                # Split outside the f-string: backslashes in f-string expressions are a SyntaxError before Python 3.12
+                version_first_line = version.split("\n")[0]
+                logger.info(f"Connected to SQL Server: {version_first_line}")
         
     except Exception as e:
         logger.error(f"Failed to connect to database: {str(e)}")

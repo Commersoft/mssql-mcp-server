@@ -16,6 +16,7 @@ from .ng_window import (
     ng_set_sort,
     ng_set_stmsql,
     ng_upsert_cols_group,
+    ng_upsert_tabs_group,
     update_view_html,
 )
 from .ng_lookups import ng_add_filter, ng_add_linked_window, ng_add_lookup, ng_create_lookup_window
@@ -24,6 +25,7 @@ from .discovery import describe, ng_diff_with_dict, ng_preview_dataset, sql_grep
 from .replicate import ng_replicate_window
 from .help_tools import help_upsert_topic
 from .ai_tools import ai_tool_register, ai_tool_sync_params
+from .repl_queue import repl_apply_pending
 
 
 CS_TOOL_NAMES = {
@@ -39,6 +41,7 @@ CS_TOOL_NAMES = {
     "ng_set_field_labels",
     "ng_set_layout_col",
     "ng_upsert_cols_group",
+    "ng_upsert_tabs_group",
     "ng_set_stmsql",
     "ng_set_dataset_props",
     "rebuild_user_rights",
@@ -60,6 +63,7 @@ CS_TOOL_NAMES = {
     "ai_tool_register",
     "ng_create_lookup_window",
     "ng_replicate_window",
+    "repl_apply_pending",
 }
 
 
@@ -81,7 +85,7 @@ def tool_descriptors():
                 "type": "object",
                 "properties": {
                     "object_name": {"type": "string", "description": "Object name (dbo. prefix optional), e.g. 'csNGAppWindowDataSetsActionsFields'."},
-                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO", "PBS", "PBSTEST", "PLATONPRE", "GRODNOFR"],
                                "description": "Target environment (default DEV)."},
                 },
                 "required": ["object_name"],
@@ -102,7 +106,7 @@ def tool_descriptors():
                     "pattern": {"type": "string", "description": "Literal substring to find (case-insensitive)."},
                     "name_like": {"type": "string", "description": "Optional: only objects whose name contains this."},
                     "top": {"type": "integer", "description": "Max hits (default 100)."},
-                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "SLGRODNO", "PBS", "PBSTEST", "PLATONPRE", "GRODNOFR"],
                                "description": "Target environment (default DEV)."},
                 },
                 "required": ["pattern"],
@@ -129,7 +133,7 @@ def tool_descriptors():
                     "cs_companies_id": {"type": "integer", "description": "Company context (default: min company)."},
                     "cs_usr_id": {"type": "integer", "description": "User context (default: min user)."},
                     "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
-                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "PBS", "PBSTEST", "PLATONPRE", "GRODNOFR"],
                                "description": "Target environment (default DEV)."},
                 },
                 "required": ["app_window_ident"],
@@ -265,7 +269,7 @@ def tool_descriptors():
                     "body": {"type": "string", "description": "The CREATE statement only (CREATE procedure dbo.<Name> ... )."},
                     "description": {"type": "string", "description": "Version description (>=3 chars)."},
                     "object_type": {"type": "string", "description": "procedure|function|view|trigger (informational)."},
-                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "PBS", "PBSTEST", "PLATONPRE", "GRODNOFR"],
                                "description": "Target environment (default DEV). Non-DEV reuses the DEV latest @v."},
                 },
                 "required": ["object_name", "body", "description"],
@@ -324,7 +328,7 @@ def tool_descriptors():
                     "thread_no": {"type": "integer", "description": "Default 8100. UWAGA: wątek bez workera = job NIGDY nie ruszy; wątki są SZEREGOWE — długie joby (LLM) trzymaj osobno od jobów o sztywnej porze. Sprawdź żywotność: select ThreadNo, max(LastInvokeTime) from csCompaniesJobs group by ThreadNo (DEV 2026-07-22: 200000 szybki pipeline, 8100 ciężkie AI, 100000 nocne, 88 minutowe). Tool ostrzega gdy wątek wygląda martwo."},
                     "job_order": {"type": "integer", "description": "Default max+100 for the company."},
                     "active": {"type": "boolean", "description": "Default true."},
-                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "PBS", "PBSTEST", "PLATONPRE", "GRODNOFR"],
                                "description": "Target environment (default DEV)."},
                 },
                 "required": ["procedure_name", "cs_companies_id", "start_time", "interval_seconds", "job_desc_pl"],
@@ -414,7 +418,7 @@ def tool_descriptors():
                 "properties": {
                     "object_name": {"type": "string"},
                     "top": {"type": "integer", "description": "Max rows (default 10)."},
-                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "PBS", "PBSTEST", "PLATONPRE", "GRODNOFR"],
                                "description": "Target environment (default DEV)."},
                 },
                 "required": ["object_name"],
@@ -535,13 +539,47 @@ def tool_descriptors():
             },
         ),
         Tool(
+            name="ng_upsert_tabs_group",
+            description=(
+                "Upsert a tabs group of linked windows (csNGAppWindowTabsGroups — per MASTER window "
+                "hosting the tab bar; analog of cols groups): tabGroupDesc_XX per language (only provided "
+                "langs written, never copies PL; PL required on create), ord (explicit group order on the "
+                "vertical tab bar; NULL = position of the group's first tab), translate_ident (optional gT "
+                "fallback). Stable G = md5('tabsGroup:<window>:<ident>') so DEV/PROD match. link_to_windows "
+                "attaches the group to existing csNGAppWindowsLinks rows (appWindowIdentTo list) AFTER the "
+                "group row exists (FK) — the JSONSave custom code refreshes the master's linkedWindows cache. "
+                "Groups render only in vertical tab layouts (outer-side-panel-tab-layout='left')."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string", "description": "MASTER window (appWindowIdentFrom of the links)."},
+                    "tab_group_ident": {"type": "string", "description": "e.g. 'TAB_GROUP_OFFER'."},
+                    "descriptions": {
+                        "type": "object",
+                        "description": "{'PL': 'Oferta', 'EN': 'Offer', ...} — langs: PL,EN,DE,FR,ES,NL,PT,RU,UK,IT,SE,SK. PL required on create.",
+                    },
+                    "ord": {"type": "integer", "description": "Explicit group order on the tab bar."},
+                    "translate_ident": {"type": "string", "description": "Optional gT ident fallback (tabGroupTranslateIdent); '' clears."},
+                    "link_to_windows": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "appWindowIdentTo of existing links to attach to this group (sets csNGAppWindowsLinks.tabGroupIdent).",
+                    },
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident", "tab_group_ident"],
+            },
+        ),
+        Tool(
             name="ng_set_stmsql",
             description=(
                 "Replace a dataset stmSQL with a MANDATORY sp_executesql test BEFORE saving: "
                 "template runs twice (with dates — apostrophe bugs only show with non-null "
                 "dates — and with empty where). Saved only if both pass. Harness provides "
                 "@where, @whereLists='{}', @isRefreshOneRecord, @csCompaniesIdStr, "
-                "@LanguageSuffix — templates using @whereLists (warehouse masks) test fine. "
+                "@csCompaniesId, @csUsrId and @LanguageSuffix — templates using warehouse "
+                "masks and typical per-user conditions test fine. "
                 "Snapshot the old stmSQL first via ng_get_window_config(include_stmsql=true). "
                 "test=false only for templates needing OTHER extra params (@csItemsIdStr...) — "
                 "verify manually then (e.g. ng_preview_dataset)."
@@ -593,7 +631,7 @@ def tool_descriptors():
                     "cs_companies_id": {"type": "integer", "description": "Narrow to this company (recommended on DEV)."},
                     "cs_usr_id": {"type": "integer", "description": "Narrow to this user."},
                     "confirm_all": {"type": "boolean", "description": "Required for a full rebuild of ALL internal users."},
-                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "PBS", "PBSTEST", "PLATONPRE", "GRODNOFR"],
                                "description": "Target environment (default DEV)."},
                 },
             },
@@ -729,7 +767,7 @@ def tool_descriptors():
                     "grant_privilege_g": {"type": "string", "description": "Required when the window has >1 privilege."},
                     "rebuild": {"type": "boolean"},
                     "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
-                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "PBS", "PBSTEST", "PLATONPRE", "GRODNOFR"],
                                "description": "Target environment (default DEV)."},
                 },
                 "required": ["app_window_ident"],
@@ -836,7 +874,7 @@ def tool_descriptors():
                     "help_contents_g": {"type": "string", "description": "Topic GUID: existing → update; unknown → INSERT with this GUID (requires subject)."},
                     "changelog_append": {"description": "'<li><b>data</b> — opis</li>' (string=PL or {PL,EN,..}) doklejany do ostatniego </ul>."},
                     "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
-                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST"],
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "PBS", "PBSTEST", "PLATONPRE", "GRODNOFR"],
                                "description": "Target environment (default DEV)."},
                 },
                 "required": [],
@@ -915,6 +953,38 @@ def tool_descriptors():
                                "description": "TARGET environment (required — source is always DEV)."},
                 },
                 "required": ["app_window_ident", "server"],
+            },
+        ),
+        Tool(
+            name="repl_apply_pending",
+            description=(
+                "Kolejka replikacji konfiguracji U KLIENTA (csReplConfigChangesClientLog — ramki 'Up to a date' "
+                "z DEV: wersje procedur V, wiersze konfiguracji I/U/D, exec E). action='status' (default, read-only): "
+                "liczniki Status -1/0/1, błędy -1 z ProcessError, blokady blockFurtherRows, zaległe wg Opr/obiektu, "
+                "pierwsze N zaległych (object_like zawęża), joby csCompaniesJobs (ostrzega gdy ApplyJob Active=0), "
+                "joby msdb ApplyBackground, ostatnie próby. action='start': uruchamia backlog W TLE przez "
+                "csReplConfigChangesClientLogApplyBackground z sp_set_session_context 'csUsrId' w tej samej sesji "
+                "(bez tego job pada 'Incorrect syntax near ,'); odmawia gdy job już biegnie lub kolejka czysta; "
+                "dry_run pokazuje co wykona. action='progress': job msdb, próby z csReplConfigChangesClientLogExecution "
+                "w oknie since_minutes, tempo, bieżący LogId, szacowany czas do końca. Zanim ręcznie przeniesiesz obiekt "
+                "na PROD (deploy_sql_object server=PROD / JSONSave) — sprawdź status: najpewniej już czeka w kolejce. "
+                "Na DEV kolejka klienta nie ma zastosowania (użyj server=PROD/TESTGRODNO/…)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["status", "start", "progress"], "description": "Default status."},
+                    "server": {"type": "string", "enum": ["DEV", "PROD", "PLAY", "LOT", "CSSQL01", "SAVPOL", "TESTGRODNO", "CERES_TEST", "PBS", "PBSTEST", "PLATONPRE", "GRODNOFR"],
+                               "description": "Target environment (default DEV — bez sensu dla start; kolejka klienta = PROD/TESTGRODNO/PLAY/…)."},
+                    "usr_login": {"type": "string", "description": "start: login csUsr, którego csUsrId trafi do session_context (np. 'jmk'). Alternatywa: cs_usr_id."},
+                    "cs_usr_id": {"type": "integer", "description": "start: csUsrId wprost (zamiast usr_login)."},
+                    "cs_companies_id": {"type": "integer", "description": "start: firma instalacji; default = jedyna firma z jobami *ReplConfigChangesClientLog* w csCompaniesJobs."},
+                    "object_like": {"type": "string", "description": "status: filtr ObjectName like '%x%' dla listy zaległych (np. 'csAIAgentsTools' albo nazwa procedury)."},
+                    "top": {"type": "integer", "minimum": 1, "description": "status: ile pierwszych zaległych wypisać (default 20)."},
+                    "since_minutes": {"type": "integer", "minimum": 1, "description": "progress: okno prób instalacji do tempa (default 60)."},
+                    "dry_run": {"type": "boolean", "description": "start: tylko raport + komendy, bez uruchomienia."},
+                },
+                "required": [],
             },
         ),
     ]
@@ -1057,6 +1127,18 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             app_window_ident=arguments.get("app_window_ident", ""),
             cols_group_ident=arguments.get("cols_group_ident", ""),
             descriptions=arguments.get("descriptions") or {},
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "ng_upsert_tabs_group":
+        return ng_upsert_tabs_group(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            tab_group_ident=arguments.get("tab_group_ident", ""),
+            descriptions=arguments.get("descriptions") or {},
+            ord=arguments.get("ord"),
+            translate_ident=arguments.get("translate_ident"),
+            link_to_windows=arguments.get("link_to_windows"),
             namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
         )
 
@@ -1328,6 +1410,20 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             visible_fields=arguments.get("visible_fields"),
             run_validator=bool(arguments.get("run_validator", True)),
             namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
+    if name == "repl_apply_pending":
+        return repl_apply_pending(
+            connection_string,
+            action=arguments.get("action") or "status",
+            usr_login=arguments.get("usr_login"),
+            cs_usr_id=int(arguments["cs_usr_id"]) if arguments.get("cs_usr_id") is not None else None,
+            cs_companies_id=int(arguments["cs_companies_id"]) if arguments.get("cs_companies_id") is not None else None,
+            object_like=arguments.get("object_like"),
+            top=int(arguments.get("top") or 20),
+            since_minutes=int(arguments.get("since_minutes") or 60),
+            dry_run=bool(arguments.get("dry_run", False)),
+            target_label=arguments.get("_target_label") or "DEV",
         )
 
     raise ValueError(f"Unknown cs tool: {name}")

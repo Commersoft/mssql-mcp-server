@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import uuid
 
@@ -16,8 +17,12 @@ logger = logging.getLogger("mssql_mcp_server.cs")
 # Shared constants
 # ---------------------------------------------------------------------------
 
-# Domyślny csAppNameSpacesG dla obiektów systemowych NG.
-DEFAULT_NAMESPACE_G = "E4B58826-69B9-4180-8A58-953B13AB2C77"
+# Domyślny csAppNameSpacesG używany przez wszystkie tools ng_*/help_*/replicate_* gdy
+# wołający nie podał namespace_g. Bez RAG_DEFAULT_NAMESPACE_G w .env spada na namespace
+# systemowy NG (poprawny tylko dla obiektów systemowych) — projekty z własnym namespace
+# (np. VuePlaton -> "PLATON B2B") MUSZĄ ustawić RAG_DEFAULT_NAMESPACE_G w .env, inaczej
+# każde wywołanie bez explicit namespace_g trafia w zły namespace.
+DEFAULT_NAMESPACE_G = os.getenv("RAG_DEFAULT_NAMESPACE_G") or "E4B58826-69B9-4180-8A58-953B13AB2C77"
 
 
 SCRIPT_CONVERTERS_G = "D107A1E4-0F2F-4D35-BA78-7308C9854044"

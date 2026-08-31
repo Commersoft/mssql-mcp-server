@@ -52,6 +52,11 @@ def deploy_sql_object(
     if not description or len(description) < 3 or description == "ADD_VERSION_DESC_HERE":
         return "Error: description is required (>= 3 chars, not the placeholder)."
 
+    # CRLF normalization: LF-only bodies land verbatim in sys.sql_modules and break
+    # csSysScriptSqlObject (splits lines by CRLF -> whole module becomes one giant line,
+    # truncated by SSMS). DB convention is CRLF, same as the repo (npm run crlf).
+    body = body.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+
     full_name = f"dbo.{name}"
     log: List[str] = []
     is_cross = target_label.upper() != "DEV"

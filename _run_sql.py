@@ -20,7 +20,12 @@ def _load_env():
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
+                v = v.strip()
+                # cudzysłowy w .env chronią '#' w haśle — do connection stringu iść nie mogą,
+                # inaczej login pada 18456 (regresja wracała już 3× — patrz rag-mcp-tools §3)
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                os.environ.setdefault(k.strip(), v)
 
 
 def _connection_string() -> str:
@@ -66,8 +71,17 @@ def main():
     _load_env()
     # utf-8-sig, nie utf-8 — PowerShell 5.1 (Out-File/Set-Content -Encoding UTF8) zapisuje BOM,
     # a MSSQL traktuje go jako znak: "Incorrect syntax near '﻿'"
-    with open(sys.argv[1], encoding="utf-8-sig") as fh:
+    with open(sys.argv[1], encoding="utf-8-sig", newline="") as fh:
         query = fh.read()
+    # Normalizacja końców linii na CRLF. Procedury cs* w bazie mają CRLF, a ten runner jest
+    # udokumentowaną ścieżką redeployu dużych obiektów (zrzut rag_get_sql_object -> edycja -> tutaj).
+    # Zrzut przychodzi z LF, więc bez tej normalizacji ciało lądowało w sys.sql_modules jako LF-only:
+    # skryptowanie zwracało wtedy 1-2 wiersze po dziesiątki tysięcy znaków i wyglądało na UCIĘTĄ
+    # procedurę. To samo robi deploy_sql_object (cs_tools/deploy.py). Incydent: csNGOnCFMails 2026-08-18.
+    normalized = query.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+    if normalized != query:
+        print(f"[crlf] znormalizowano końce linii na CRLF ({query.count(chr(10))} linii)")
+        query = normalized
     # split na separatorach GO (case-insensitive, osobna linia) — pyodbc nie zna GO
     batches = [b.strip() for b in re.split(r"(?im)^\s*GO\s*$", query) if b.strip()]
     with pyodbc.connect(_connection_string(), autocommit=True) as conn:
