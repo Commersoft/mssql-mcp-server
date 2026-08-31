@@ -861,12 +861,17 @@ def ng_upsert_tabs_group(
                 rec["ord"] = int(ord)
             if translate_ident is not None:
                 rec["tabGroupTranslateIdent"] = translate_ident or None
-            if g and len(rec) == 6:
-                return f"Error: nothing to change for existing group '{tab_group_ident}' (pass descriptions / ord / translate_ident)."
+            # len(rec) == 6 = only the key fields (_opr, Id, G, namespace, window, ident) — no group change;
+            # attaching links alone is still a valid call, so don't reject it and don't send an empty update.
+            group_changed = not g or len(rec) > 6
+            if g and not group_changed and not link_to_windows:
+                return (f"Error: nothing to change for existing group '{tab_group_ident}' "
+                        "(pass descriptions / ord / translate_ident / link_to_windows).")
 
-            resp = _jsonsave(cur, "csNGAppWindowTabsGroupsJSONSave", [rec])
-            if resp:
-                return f"TabsGroups JSONSave WARNING:\n{resp}"
+            if group_changed:
+                resp = _jsonsave(cur, "csNGAppWindowTabsGroupsJSONSave", [rec])
+                if resp:
+                    return f"TabsGroups JSONSave WARNING:\n{resp}"
 
             linked = 0
             if link_to_windows:
@@ -901,7 +906,7 @@ def ng_upsert_tabs_group(
                     linked = len(rows)
 
     out = [
-        f"OK: tabs group '{tab_group_ident}' {'updated' if g else 'created'} in {app_window_ident} "
+        f"OK: tabs group '{tab_group_ident}' {('updated' if group_changed else 'unchanged') if g else 'created'} in {app_window_ident} "
         f"(langs: {', '.join(sorted(descriptions)) or '-'}"
         f"{', ord=' + str(ord) if ord is not None else ''}"
         f"{', translateIdent=' + translate_ident if translate_ident else ''}).",

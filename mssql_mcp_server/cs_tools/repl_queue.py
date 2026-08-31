@@ -369,7 +369,35 @@ def _start(
             return f"Error: kilka firm z jobami kolejki ({companies}) — podaj cs_companies_id."
     cs_companies_id = int(cs_companies_id)
 
-    # 3. guards
+    # 3. guards — pod blokadą aplikacyjną: dwa równoległe starty mogłyby oba przejść check
+    #    „job nie biegnie" i odpalić dwa ApplyBackground na tej samej kolejce (TOCTOU)
+    got = cur.execute(
+        "declare @r int; "
+        "exec @r = sys.sp_getapplock @Resource = N'csRepl_ApplyPending_start', "
+        "  @LockMode = N'Exclusive', @LockOwner = N'Session', @LockTimeout = 0; "
+        "select @r r"
+    ).fetchone()
+    if got is None or int(got[0]) < 0:
+        return ("ODMOWA: inny start repl_apply_pending trwa w tej chwili (applock 'csRepl_ApplyPending_start' zajęty) — "
+                "sprawdź action='progress'.")
+    try:
+        return _start_locked(cur, lines, uid, login, cs_companies_id, dry_run, target_label)
+    finally:
+        try:
+            cur.execute("exec sys.sp_releaseapplock @Resource = N'csRepl_ApplyPending_start', @LockOwner = N'Session'")
+        except Exception:  # noqa: BLE001 — lock i tak zwalnia się z końcem sesji
+            pass
+
+
+def _start_locked(
+    cur,
+    lines: List[str],
+    uid: int,
+    login: str,
+    cs_companies_id: int,
+    dry_run: bool,
+    target_label: str,
+) -> str:
     pending = _pending_count(cur)
     errors = _error_rows(cur, top=3)
     blocking = _blocking_rows(cur)
@@ -379,6 +407,11 @@ def _start(
     lines.append(f"cel: {target_label} | csUsrId {uid} ({login}) | csCompaniesId {cs_companies_id} | zaległe (Status -1/0): {pending}")
     if not pending:
         lines.append("Nic do zrobienia — kolejka czysta. Nie startuję.")
+        return "\n".join(lines)
+    if msdb_rows is None:
+        lines.append("ODMOWA: brak dostępu do msdb na tym profilu — nie da się zweryfikować, czy ApplyBackground już "
+                     "biegnie (drugi start na tej samej kolejce to wyścig). Uruchom z profilu z dostępem do msdb "
+                     "albo sprawdź joby ręcznie.")
         return "\n".join(lines)
     if running:
         lines.append(f"ODMOWA: job '{running}' jeszcze biegnie w msdb — drugi ApplyBackground na tej samej kolejce to wyścig. "
@@ -466,12 +499,18 @@ def repl_apply_pending(
     act = (action or "status").strip().lower()
     if act not in ("status", "start", "progress"):
         return f"Error: action must be status|start|progress (got '{action}')."
+    top = int(top or 20)
+    if top <= 0:
+        return f"Error: top must be > 0 (got {top}) — trafia do 'select top (?)'."
+    since_minutes = int(since_minutes or 60)
+    if since_minutes <= 0:
+        return f"Error: since_minutes must be > 0 (got {since_minutes}) — okno 'ostatnie N minut' nie może być ujemne."
     with connect(connection_string, autocommit=True) as conn:
         with conn.cursor() as cur:
             if not _exec_scalar(cur, "select object_id(N'dbo.csReplConfigChangesClientLog')"):
                 return f"Error: brak tabeli csReplConfigChangesClientLog na {target_label} — to nie jest baza cs* z kolejką klienta."
             if act == "status":
-                return _status(cur, object_like, int(top or 20))
+                return _status(cur, object_like, top)
             if act == "progress":
-                return _progress(cur, int(since_minutes or 60))
+                return _progress(cur, since_minutes)
             return _start(cur, usr_login, cs_usr_id, cs_companies_id, bool(dry_run), target_label)
