@@ -146,7 +146,11 @@ def tool_descriptors():
                 "[{field, visible?, ord?, width?, group?}]. Same pitfalls as "
                 "ng_set_layout_col (minimal-U, int isVisible, non-null width on INSERT, "
                 "group existence check). Ideal for hiding technical cols + reordering a "
-                "whole grid after csCreateNGWindowFromTableForAI."
+                "whole grid after csCreateNGWindowFromTableForAI. THE ONLY safe way to "
+                "reorder ords: validates targets against the unique ord index and, when "
+                "occupied ords are reused, saves TWO-PHASE (park at max+1000, then final) "
+                "so upgrade packages replaying the log row-by-row don't collide on "
+                "TEST/PROD. Reordering requires the FULL permutation in `columns`."
             ),
             inputSchema={
                 "type": "object",
@@ -497,7 +501,10 @@ def tool_descriptors():
                 "group. UPDATE uses minimal-U (avoids label re-validation trap for joined "
                 "fields); INSERT auto-fills labelDataSetIdent/labelDataFieldIdent + non-null "
                 "width (NULL width silently collapses the column). isVisible as int 1/0. "
-                "Verifies the cols group exists. Grouped columns must be adjacent by ord."
+                "Verifies the cols group exists. Grouped columns must be adjacent by ord. "
+                "ord already held by another row = error (unique index; row-by-row replay "
+                "would break upgrade packages) — reorder via ng_bulk_layout (full "
+                "permutation, auto two-phase) or use a free ord above max."
             ),
             inputSchema={
                 "type": "object",

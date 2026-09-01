@@ -635,7 +635,11 @@ def ng_set_layout_col(
       - isVisible serialized as int 1/0 (bit -> true/false breaks the proc, msg 245);
       - INSERT always includes labelDataSetIdent/labelDataFieldIdent and a non-null width
         (NULL width silently collapses the column);
-      - cols_group_ident is verified against csNGAppWindowColsGroups (warn if missing).
+      - cols_group_ident is verified against csNGAppWindowColsGroups (warn if missing);
+      - ord occupied by ANOTHER row = hard error (unique index uq_...layoutIdent_ord): a
+        single-row reorder onto a taken ord fails here and, replayed row-by-row by upgrade
+        packages, blocks the package on TEST/PROD — use ng_bulk_layout with the full
+        permutation (auto two-phase) or a free ord above max.
     """
     warnings: List[str] = []
     if width is not None and width % 60 != 0:
@@ -681,6 +685,22 @@ def ng_set_layout_col(
                 namespace_g, app_window_ident, data_set_ident, layout_ident, field_ident,
             )
             lc = cur.fetchone()
+
+            if ord is not None:
+                holder = _exec_scalar(
+                    cur,
+                    "select dataFieldIdent from dbo.csNGAppWindowDataSetsLayoutsCols with(nolock) "
+                    "where csAppNameSpacesG = ? and appWindowIdent = ? and dataSetIdent = ? "
+                    "and layoutIdent = ? and ord = ? and dataFieldIdent <> ?",
+                    namespace_g, app_window_ident, data_set_ident, layout_ident, int(ord), field_ident,
+                )
+                if holder:
+                    return (f"Error: ord {int(ord)} is already held by '{holder}' "
+                            "(unique index uq_...layoutIdent_ord). A single-row reorder onto an "
+                            "occupied ord fails here AND — replayed row-by-row by upgrade packages — "
+                            "blocks deployment on TEST/PROD. Use ng_bulk_layout with the full "
+                            "permutation (it parks + renumbers two-phase automatically) or pick a "
+                            "free ord above the current max.")
 
             if lc:
                 rec = {
@@ -1075,14 +1095,30 @@ def ng_bulk_layout(connection_string: str, app_window_ident: str, columns: Seque
                    namespace_g: str = DEFAULT_NAMESPACE_G) -> str:
     """Bulk upsert of grid layout columns. Each item: {field, visible?, ord?, width?, group?}.
     Same pitfalls as ng_set_layout_col (minimal-U, int isVisible, non-null width on INSERT,
-    group existence check) but one connection + one MCP call for the whole grid."""
+    group existence check) but one connection + one MCP call for the whole grid.
+    Reorder-safe (unique index uq_...layoutIdent_ord): target ords are validated up front
+    (duplicates / conflicts with rows not included in the call = error), and when any target
+    ord is currently held by another row the save runs TWO-PHASE — first all moved rows are
+    parked at max(ord)+1000+i, then the final ords are written. Upgrade packages replay the
+    repl log row-by-row (single-row UPDATEs in ReplicateRow), so a one-phase permutation that
+    passes on DEV (set-based UPDATE) collides on TEST/PROD and blocks the whole package."""
     if not columns:
         return "Error: columns list is required."
     log: List[str] = []
     warnings: List[str] = []
     with connect(connection_string, autocommit=True) as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                "select dataFieldIdent, csNGAppWindowDataSetsLayoutsColsId, "
+                "csNGAppWindowDataSetsLayoutsColsG, ord "
+                "from dbo.csNGAppWindowDataSetsLayoutsCols with(nolock) "
+                "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and layoutIdent=?",
+                namespace_g, app_window_ident, data_set_ident, layout_ident,
+            )
+            current = {r[0]: (int(r[1]), str(r[2]).upper(), int(r[3])) for r in cur.fetchall()}
+            max_ord = max((o for _i, _g, o in current.values()), default=0)
             known_groups: dict = {}
+            resolved: List[tuple] = []  # (field, rec, mode, changes)
             for item in columns:
                 field = item.get("field")
                 if not field:
@@ -1108,17 +1144,10 @@ def ng_bulk_layout(connection_string: str, app_window_ident: str, columns: Seque
                             warnings.append(f"cols group '{grp}' does not exist (create via ng_upsert_cols_group).")
                 if not changes:
                     continue
-                cur.execute(
-                    "select csNGAppWindowDataSetsLayoutsColsId, csNGAppWindowDataSetsLayoutsColsG "
-                    "from dbo.csNGAppWindowDataSetsLayoutsCols with(nolock) "
-                    "where csAppNameSpacesG=? and appWindowIdent=? and dataSetIdent=? and layoutIdent=? and dataFieldIdent=?",
-                    namespace_g, app_window_ident, data_set_ident, layout_ident, field,
-                )
-                lc = cur.fetchone()
-                if lc:
+                if field in current:
                     rec = {"_opr": "U",
-                           "csNGAppWindowDataSetsLayoutsColsId": int(lc[0]),
-                           "csNGAppWindowDataSetsLayoutsColsG": str(lc[1]).upper()}
+                           "csNGAppWindowDataSetsLayoutsColsId": current[field][0],
+                           "csNGAppWindowDataSetsLayoutsColsG": current[field][1]}
                     rec.update(changes)
                     mode = "U"
                 else:
@@ -1143,7 +1172,47 @@ def ng_bulk_layout(connection_string: str, app_window_ident: str, columns: Seque
                     rec.update(changes)
                     if "width" not in changes:
                         rec["width"] = 120.0
+                    if "ord" not in changes:
+                        max_ord += 1
+                        rec["ord"] = max_ord
                     mode = "I"
+                max_ord = max(max_ord, int(rec["ord"])) if "ord" in rec else max_ord
+                resolved.append((field, rec, mode, changes))
+
+            # --- ord safety: validate targets, park two-phase when values are being reused ---
+            desired = {f: int(rec["ord"]) for f, rec, _m, _c in resolved if "ord" in rec}
+            by_ord: dict = {}
+            for f, o in desired.items():
+                by_ord.setdefault(o, []).append(f)
+            dups = {o: fs for o, fs in by_ord.items() if len(fs) > 1}
+            if dups:
+                return ("Error: duplicate target ord (unique index uq_...layoutIdent_ord): "
+                        + "; ".join(f"{o} -> {', '.join(fs)}" for o, fs in sorted(dups.items())) + ".")
+            holders = {o: f for f, (_i, _g, o) in current.items()}
+            blocked = [f"ord {o} wanted by '{f}' is held by '{holders[o]}', which this call does not move"
+                       for f, o in sorted(desired.items(), key=lambda kv: kv[1])
+                       if holders.get(o) not in (None, f) and holders[o] not in desired]
+            if blocked:
+                return ("Error: target ord held by a row outside this call — pass the FULL permutation "
+                        "(every row whose ord must change) or pick free ords (> max):\n  - "
+                        + "\n  - ".join(blocked))
+            need_park = any(holders.get(o) not in (None, f) for f, o in desired.items())
+            if need_park:
+                park = sorted(f for f, o in desired.items()
+                              if f in current and current[f][2] != o)
+                base = max_ord + 1000
+                park_recs = [{"_opr": "U",
+                              "csNGAppWindowDataSetsLayoutsColsId": current[f][0],
+                              "csNGAppWindowDataSetsLayoutsColsG": current[f][1],
+                              "ord": base + i}
+                             for i, f in enumerate(park, start=1)]
+                resp = _jsonsave(cur, "csNGAppWindowDataSetsLayoutsColsJSONSave", park_recs)
+                if resp:
+                    return f"JSONSave WARNING in ord-park phase (final ords NOT written):\n{resp}"
+                log.append(f"parked {len(park_recs)} row(s) at ord {base + 1}..{base + len(park_recs)} "
+                           "(two-phase reorder — replay-safe for upgrade packages)")
+
+            for field, rec, mode, changes in resolved:
                 resp = _jsonsave(cur, "csNGAppWindowDataSetsLayoutsColsJSONSave", [rec])
                 if resp:
                     return f"JSONSave WARNING at field '{field}' (after {len(log)} ok):\n{resp}"
