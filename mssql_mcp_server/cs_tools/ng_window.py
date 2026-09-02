@@ -1197,27 +1197,42 @@ def ng_bulk_layout(connection_string: str, app_window_ident: str, columns: Seque
                         "(every row whose ord must change) or pick free ords (> max):\n  - "
                         + "\n  - ".join(blocked))
             need_park = any(holders.get(o) not in (None, f) for f, o in desired.items())
-            if need_park:
-                park = sorted(f for f, o in desired.items()
-                              if f in current and current[f][2] != o)
-                base = max_ord + 1000
-                park_recs = [{"_opr": "U",
-                              "csNGAppWindowDataSetsLayoutsColsId": current[f][0],
-                              "csNGAppWindowDataSetsLayoutsColsG": current[f][1],
-                              "ord": base + i}
-                             for i, f in enumerate(park, start=1)]
-                resp = _jsonsave(cur, "csNGAppWindowDataSetsLayoutsColsJSONSave", park_recs)
-                if resp:
-                    return f"JSONSave WARNING in ord-park phase (final ords NOT written):\n{resp}"
-                log.append(f"parked {len(park_recs)} row(s) at ord {base + 1}..{base + len(park_recs)} "
-                           "(two-phase reorder — replay-safe for upgrade packages)")
 
-            for field, rec, mode, changes in resolved:
-                resp = _jsonsave(cur, "csNGAppWindowDataSetsLayoutsColsJSONSave", [rec])
-                if resp:
-                    return f"JSONSave WARNING at field '{field}' (after {len(log)} ok):\n{resp}"
-                log.append(f"{mode} {field} {changes}")
-    msg = f"OK: ng_bulk_layout {app_window_ident}/{data_set_ident} — {len(log)} column(s) applied."
+            # --- save: park + final in ONE transaction. With autocommit the park phase was
+            # durable on its own, so a failure in the final loop left rows at max+1000+i
+            # (and a half-applied permutation). Rollback also drops the repl-log entries
+            # (trigger writes them in the same tran), so upgrade packages never see a torso.
+            # Same pattern as help_tools.replace_content. *JSONSave with @tran_cnt > 0 does
+            # not roll back on its own and returns the error in @response.
+            conn.autocommit = False
+            try:
+                if need_park:
+                    park = sorted(f for f, o in desired.items()
+                                  if f in current and current[f][2] != o)
+                    base = max_ord + 1000
+                    park_recs = [{"_opr": "U",
+                                  "csNGAppWindowDataSetsLayoutsColsId": current[f][0],
+                                  "csNGAppWindowDataSetsLayoutsColsG": current[f][1],
+                                  "ord": base + i}
+                                 for i, f in enumerate(park, start=1)]
+                    resp = _jsonsave(cur, "csNGAppWindowDataSetsLayoutsColsJSONSave", park_recs)
+                    if resp:
+                        raise RuntimeError(f"JSONSave in ord-park phase:\n{resp}")
+                    log.append(f"parked {len(park_recs)} row(s) at ord {base + 1}..{base + len(park_recs)} "
+                               "(two-phase reorder — replay-safe for upgrade packages)")
+
+                for field, rec, mode, changes in resolved:
+                    resp = _jsonsave(cur, "csNGAppWindowDataSetsLayoutsColsJSONSave", [rec])
+                    if resp:
+                        raise RuntimeError(f"JSONSave at field '{field}' (after {len(log)} ok):\n{resp}")
+                    log.append(f"{mode} {field} {changes}")
+                conn.commit()
+            except Exception as exc:
+                conn.rollback()
+                conn.autocommit = True
+                return f"ng_bulk_layout ROLLED BACK (nothing changed, all ords intact): {exc}"
+            conn.autocommit = True
+    msg =f"OK: ng_bulk_layout {app_window_ident}/{data_set_ident} — {len(log)} column(s) applied."
     if log:
         msg += "\n  " + "\n  ".join(log)
     if warnings:
