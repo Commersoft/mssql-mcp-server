@@ -10,6 +10,7 @@ from .ng_window import (
     ng_bulk_layout,
     ng_get_window_config,
     ng_register_translates,
+    ng_rebuild_window_cache,
     ng_set_dataset_props,
     ng_set_field_labels,
     ng_set_layout_col,
@@ -26,9 +27,11 @@ from .replicate import ng_replicate_window
 from .help_tools import help_upsert_topic
 from .ai_tools import ai_tool_register, ai_tool_sync_params
 from .repl_queue import repl_apply_pending
+from .translations import audit_ui_translations
 
 
 CS_TOOL_NAMES = {
+    "audit_ui_translations",
     "deploy_sql_object",
     "cs_jsonsave",
     "add_cs_column",
@@ -44,6 +47,7 @@ CS_TOOL_NAMES = {
     "ng_upsert_tabs_group",
     "ng_set_stmsql",
     "ng_set_dataset_props",
+    "ng_rebuild_window_cache",
     "rebuild_user_rights",
     "ai_tool_sync_params",
     "ng_add_lookup",
@@ -71,6 +75,18 @@ def tool_descriptors():
     from mcp.types import Tool
 
     return [
+        Tool(
+            name="audit_ui_translations",
+            description="Read-only UI translation coverage across NG labels, layouts, actions, menu and registered csTranslate rows. Uses csSupLang and real columns; reports empty/whitespace values separately from missing language columns. Excludes business records and URL slugs.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "languages": {"type": "array", "items": {"type": "string"}, "description": "Default: all languages in csSupLang."},
+                    "table_name": {"type": "string", "description": "Optional UI table; validated against the fixed UI whitelist."},
+                    "sample_limit": {"type": "integer", "minimum": 0, "maximum": 100, "default": 20},
+                },
+            },
+        ),
         Tool(
             name="describe",
             description=(
@@ -174,7 +190,8 @@ def tool_descriptors():
                 "Register gT() idents on a window (csNGAppWindowTranslates). Each item: "
                 "{ident, cs_translate_g?} to reuse, OR {ident, PL, EN, ...} to "
                 "reuse-by-content (match Content_PL+Content_EN) or create a new "
-                "csTranslate. Idempotent on (appWindowIdent, translateIdent)."
+                "csTranslate. Supplied languages fill empty fields on reused rows; existing text is preserved. "
+                "Idempotent on (appWindowIdent, translateIdent)."
             ),
             inputSchema={
                 "type": "object",
@@ -485,7 +502,7 @@ def tool_descriptors():
                     "field_ident": {"type": "string"},
                     "labels": {
                         "type": "object",
-                        "description": "{'PL': {'lab': '...', 'col': '...', 'watermark': '...'}, 'EN': {...}} — each key optional; langs: PL,EN,DE,FR,ES,NL,PT,RU,UK,IT.",
+                        "description": "{'PL': {'lab': '...', 'col': '...', 'watermark': '...'}, 'EN': {...}} — each key optional; langs: PL,EN,DE,FR,ES,NL,PT,RU,UK,IT,SE,SK,HR,CZ.",
                     },
                     "data_set_ident": {"type": "string", "description": "Default 'main'."},
                     "target": {"type": "string", "description": "'field' (default) or 'whereField' (filter panel)."},
@@ -538,7 +555,7 @@ def tool_descriptors():
                     "cols_group_ident": {"type": "string"},
                     "descriptions": {
                         "type": "object",
-                        "description": "{'PL': 'Obowiązuje', 'EN': 'Valid', ...} — langs: PL,EN,DE,FR,ES,NL,PT,RU,UK,IT,SE,SK.",
+                        "description": "{'PL': 'Obowiązuje', 'EN': 'Valid', ...} — langs: PL,EN,DE,FR,ES,NL,PT,RU,UK,IT,SE,SK,HR,CZ.",
                     },
                     "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
                 },
@@ -564,7 +581,7 @@ def tool_descriptors():
                     "tab_group_ident": {"type": "string", "description": "e.g. 'TAB_GROUP_OFFER'."},
                     "descriptions": {
                         "type": "object",
-                        "description": "{'PL': 'Oferta', 'EN': 'Offer', ...} — langs: PL,EN,DE,FR,ES,NL,PT,RU,UK,IT,SE,SK. PL required on create.",
+                        "description": "{'PL': 'Oferta', 'EN': 'Offer', ...} — langs: PL,EN,DE,FR,ES,NL,PT,RU,UK,IT,SE,SK,HR,CZ. PL required on create.",
                     },
                     "ord": {"type": "integer", "description": "Explicit group order on the tab bar."},
                     "translate_ident": {"type": "string", "description": "Optional gT ident fallback (tabGroupTranslateIdent); '' clears."},
@@ -621,6 +638,23 @@ def tool_descriptors():
                     "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
                 },
                 "required": ["app_window_ident", "props"],
+            },
+        ),
+        Tool(
+            name="ng_rebuild_window_cache",
+            description=(
+                "Atomically rebuild csNGAppWindows.dataSets through csNGAppWindowDataSetsJSONSave. "
+                "Uses a temporary pageSize change and restoration in one transaction because an "
+                "unchanged minimal-U can be optimized away before the cache-rebuild tail. Verifies "
+                "the original pageSize and byte-for-byte equality with the central generator before commit."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_window_ident": {"type": "string"},
+                    "namespace_g": {"type": "string", "description": "csAppNameSpacesG (default Standard)."},
+                },
+                "required": ["app_window_ident"],
             },
         ),
         Tool(
@@ -1170,6 +1204,13 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
         )
 
+    if name == "ng_rebuild_window_cache":
+        return ng_rebuild_window_cache(
+            connection_string,
+            app_window_ident=arguments.get("app_window_ident", ""),
+            namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
+        )
+
     if name == "rebuild_user_rights":
         cid = arguments.get("cs_companies_id")
         uid = arguments.get("cs_usr_id")
@@ -1204,6 +1245,9 @@ def handle_tool(name: str, arguments: dict, connection_string: str) -> str:
             auto_sets=bool(arguments.get("auto_sets", False)),
             namespace_g=arguments.get("namespace_g") or DEFAULT_NAMESPACE_G,
         )
+
+    if name == "audit_ui_translations":
+        return audit_ui_translations(connection_string, languages=arguments.get("languages"), table_name=arguments.get("table_name"), sample_limit=arguments.get("sample_limit", 20))
 
     if name == "describe":
         return describe(

@@ -34,6 +34,8 @@ Tools:
                         BEFORE saving (with and without dates).
 - ng_set_dataset_props : update whitelisted csNGAppWindowDataSets columns (pageSize,
                         pagingDisabled, getMetaInfo-like toggles) via minimal-U.
+- ng_rebuild_window_cache : atomically force and verify regeneration of a window's
+                        persisted dataSets cache through JSONSave.
 - rebuild_user_rights : rebuild per-user cache (appMainMenuJSON, appWindowIdentsWithRights,
                         warehousesRights) after menu/window/privileges changes.
 - ai_tool_sync_params : sync csAIAgentsToolsParams with an AI tool procedure (upsert with
@@ -94,6 +96,7 @@ from .ng_window import (
     ng_bulk_layout,
     ng_get_window_config,
     ng_register_translates,
+    ng_rebuild_window_cache,
     ng_set_dataset_props,
     ng_set_field_labels,
     ng_set_layout_col,

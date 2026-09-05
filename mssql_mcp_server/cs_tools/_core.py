@@ -32,12 +32,13 @@ SCRIPT_CONVERTERS_G = "D107A1E4-0F2F-4D35-BA78-7308C9854044"
 COLUMN_DESC_LANGS = ["EN", "PL", "DE", "FR", "ES", "IT", "NL", "PT", "RU", "UK", "SK", "SE"]
 
 
-# Języki fizycznie obecne w csNGAppWindowDataSetsFields (lab/col/watermark) — bez SK/SE.
-NG_LABEL_LANGS = ["PL", "EN", "DE", "FR", "ES", "NL", "PT", "RU", "UK", "IT"]
+# Języki definicji NG (lab/col/watermark i grupy) — zgodne z csSupLang.
+NG_LABEL_LANGS = ["PL", "EN", "DE", "FR", "ES", "NL", "PT", "RU", "UK", "IT", "SE", "SK", "HR", "CZ"]
 
 
-# Języki w csNGAppWindowColsGroups.dataFieldColsGroupDesc_* — pełne 12.
-NG_COLSGROUP_LANGS = ["PL", "EN", "DE", "FR", "ES", "NL", "PT", "RU", "UK", "IT", "SE", "SK"]
+# csTranslate ma również historyczną kolumnę HU, której nie mają tabele definicji NG.
+NG_COLSGROUP_LANGS = NG_LABEL_LANGS.copy()
+TRANSLATE_LANGS = [*NG_LABEL_LANGS, "HU"]
 
 
 # Kolumny csNGAppWindowDataSets dozwolone w ng_set_dataset_props (bez kluczy,
@@ -121,6 +122,33 @@ def _stable_guid(cur, seed: str) -> str:
 # 23. Shared helper — ensure a csTranslate row for given texts (reuse/create)
 # ---------------------------------------------------------------------------
 
+def _fill_translate_gaps(cur, translate_g: str, texts: dict) -> int:
+    """Fill supplied empty languages on a reused row, preserving every other column."""
+    supplied = {f"Content_{lang}": value for lang, value in texts.items()
+                if lang in TRANSLATE_LANGS and isinstance(value, str) and value.strip()}
+    if not supplied:
+        return 0
+    raw = _exec_scalar(
+        cur,
+        "select * from dbo.csTranslate with(nolock) where csTranslateG = ? "
+        "for json path, without_array_wrapper, include_null_values",
+        str(translate_g),
+    )
+    if not raw:
+        raise ValueError(f"csTranslate {translate_g} does not exist.")
+    row = json.loads(raw)
+    missing = {column: value for column, value in supplied.items()
+               if not str(row.get(column) or "").strip()}
+    if not missing:
+        return 0
+    row.update(missing)
+    row["_opr"] = "U"
+    resp = _jsonsave(cur, "csTranslateJSONSave", [row])
+    if resp:
+        raise RuntimeError(f"csTranslateJSONSave: {resp}")
+    return len(missing)
+
+
 def _ensure_translate(cur, texts: dict) -> tuple:
     """Return (csTranslateG, action). Reuse by Content_PL+Content_EN or create."""
     pl = texts.get("PL")
@@ -134,11 +162,12 @@ def _ensure_translate(cur, texts: dict) -> tuple:
         pl, en,
     )
     if tg:
+        _fill_translate_gaps(cur, tg, texts)
         return str(tg).upper(), "reused"
     tg = _new_guid()
     row = {"_opr": "I", "csTranslateG": tg}
     for lang, val in texts.items():
-        if lang in NG_COLSGROUP_LANGS and val:
+        if lang in TRANSLATE_LANGS and val:
             row[f"Content_{lang}"] = val
     resp = _jsonsave(cur, "csTranslateJSONSave", [row])
     if resp:

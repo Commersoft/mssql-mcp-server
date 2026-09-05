@@ -13,8 +13,10 @@ from ._core import (
     NG_COLSGROUP_LANGS,
     NG_DATASET_PROPS_WHITELIST,
     NG_LABEL_LANGS,
+    TRANSLATE_LANGS,
     _as_int,
     _exec_scalar,
+    _fill_translate_gaps,
     _jsonsave,
     _new_guid,
     _stable_guid,
@@ -1087,6 +1089,120 @@ def ng_set_dataset_props(
 
 
 # ---------------------------------------------------------------------------
+# 12b. ng_rebuild_window_cache
+# ---------------------------------------------------------------------------
+
+def ng_rebuild_window_cache(
+    connection_string: str,
+    app_window_ident: str,
+    namespace_g: str = DEFAULT_NAMESPACE_G,
+) -> str:
+    """Atomically rebuild csNGAppWindows.dataSets through the supported JSONSave path.
+
+    A minimal-U with an unchanged value can be removed from the JSONSave work table before
+    its cache-rebuild tail runs. Force a real pageSize change and restore it inside one outer
+    transaction, then compare the persisted cache with the central generator before commit.
+    """
+    if not isinstance(app_window_ident, str) or not app_window_ident.strip():
+        return "Error: app_window_ident is required."
+
+    conn = connect(connection_string, autocommit=True)
+    transaction_started = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("begin transaction")
+            transaction_started = True
+            cur.execute(
+                "select top 1 csNGAppWindowDataSetsId, csNGAppWindowDataSetsG, pageSize, dataSetIdent "
+                "from dbo.csNGAppWindowDataSets with(nolock) "
+                "where csAppNameSpacesG = ? and appWindowIdent = ? and pageSize is not null "
+                "order by ord, dataSetIdent",
+                namespace_g, app_window_ident.strip(),
+            )
+            ds = cur.fetchone()
+            if not ds:
+                raise ValueError(
+                    f"window {app_window_ident.strip()} has no dataset with a non-null pageSize."
+                )
+
+            dataset_id = int(ds[0])
+            dataset_g = str(ds[1]).upper()
+            original_page_size = int(ds[2])
+            data_set_ident = str(ds[3])
+            temporary_page_size = (
+                original_page_size + 1
+                if original_page_size < 2147483647
+                else original_page_size - 1
+            )
+            base_rec = {
+                "_opr": "U",
+                "csNGAppWindowDataSetsId": dataset_id,
+                "csNGAppWindowDataSetsG": dataset_g,
+            }
+
+            resp = _jsonsave(
+                cur,
+                "csNGAppWindowDataSetsJSONSave",
+                [{**base_rec, "pageSize": temporary_page_size}],
+            )
+            if resp:
+                raise RuntimeError(f"temporary JSONSave failed: {resp}")
+
+            resp = _jsonsave(
+                cur,
+                "csNGAppWindowDataSetsJSONSave",
+                [{**base_rec, "pageSize": original_page_size}],
+            )
+            if resp:
+                raise RuntimeError(f"restore JSONSave failed: {resp}")
+
+            cur.execute(
+                "select d.pageSize, "
+                "iif(convert(varbinary(max), isnull(w.dataSets, N'')) = "
+                "convert(varbinary(max), isnull(dbo.csNGFnAppWindowDataSets4AppWindowJSON(?, ?), N'')), 1, 0), "
+                "datalength(w.dataSets), "
+                "datalength(dbo.csNGFnAppWindowDataSets4AppWindowJSON(?, ?)) "
+                "from dbo.csNGAppWindowDataSets d with(nolock) "
+                "join dbo.csNGAppWindows w with(nolock) "
+                "on w.csAppNameSpacesG = d.csAppNameSpacesG and w.appWindowIdent = d.appWindowIdent "
+                "where d.csNGAppWindowDataSetsId = ?",
+                namespace_g, app_window_ident.strip(),
+                namespace_g, app_window_ident.strip(),
+                dataset_id,
+            )
+            verification = cur.fetchone()
+            if not verification:
+                raise RuntimeError("verification row is missing.")
+            if int(verification[0]) != original_page_size:
+                raise RuntimeError(
+                    f"pageSize restore mismatch: expected {original_page_size}, got {verification[0]}."
+                )
+            if int(verification[1]) != 1:
+                raise RuntimeError("persisted dataSets cache differs from the central generator.")
+
+            cur.execute("commit transaction")
+            transaction_started = False
+            cached_bytes = int(verification[2] or 0)
+            generated_bytes = int(verification[3] or 0)
+    except Exception as error:
+        if transaction_started:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("if @@trancount > 0 rollback transaction")
+            except Exception:
+                pass
+        return f"Error: cache rebuild rolled back for {app_window_ident.strip()}: {error}"
+    finally:
+        conn.close()
+
+    return (
+        f"OK: rebuilt dataSets cache for {app_window_ident.strip()} via "
+        f"{data_set_ident}; pageSize restored to {original_page_size}; "
+        f"cache matches generator ({cached_bytes}/{generated_bytes} bytes)."
+    )
+
+
+# ---------------------------------------------------------------------------
 # 19. ng_bulk_layout — set visibility/order/width/group for many columns in one call
 # ---------------------------------------------------------------------------
 
@@ -1253,6 +1369,12 @@ def ng_register_translates(connection_string: str, app_window_ident: str,
     Idempotent on (appWindowIdent, translateIdent)."""
     if not translates:
         return "Error: translates list is required."
+    for item in translates:
+        if not isinstance(item, dict) or not item.get("ident"):
+            return "Error: each item needs 'ident'."
+        unknown = set(item) - set(TRANSLATE_LANGS) - {"ident", "cs_translate_g"}
+        if unknown:
+            return f"Error: unknown translation keys for '{item['ident']}': {', '.join(sorted(unknown))}."
     log: List[str] = []
     with connect(connection_string, autocommit=True) as conn:
         with conn.cursor() as cur:
@@ -1261,7 +1383,7 @@ def ng_register_translates(connection_string: str, app_window_ident: str,
                 if not ident:
                     return f"Error: each item needs 'ident': {item}"
                 tg = item.get("cs_translate_g")
-                texts = {k: v for k, v in item.items() if k in NG_COLSGROUP_LANGS}
+                texts = {k: v for k, v in item.items() if k in TRANSLATE_LANGS}
                 if not tg:
                     pl = texts.get("PL")
                     en = texts.get("EN")
@@ -1288,6 +1410,13 @@ def ng_register_translates(connection_string: str, app_window_ident: str,
                 else:
                     tg = str(tg).upper()
                     action = "reused by GUID"
+                if action.startswith("reused"):
+                    try:
+                        filled = _fill_translate_gaps(cur, tg, texts)
+                    except (ValueError, RuntimeError) as error:
+                        return f"Error for '{ident}': {error}"
+                    if filled:
+                        action += f", filled {filled} language(s)"
                 existing = _exec_scalar(
                     cur,
                     "select csNGAppWindowTranslatesG from dbo.csNGAppWindowTranslates with(nolock) "
@@ -1302,6 +1431,13 @@ def ng_register_translates(connection_string: str, app_window_ident: str,
                     "translateIdent": ident,
                     "csTranslateG": str(tg).upper(),
                 }
+                if existing:
+                    link["csNGAppWindowTranslatesId"] = int(_exec_scalar(
+                        cur,
+                        "select csNGAppWindowTranslatesId from dbo.csNGAppWindowTranslates with(nolock) "
+                        "where csNGAppWindowTranslatesG = ?",
+                        str(existing),
+                    ))
                 resp = _jsonsave(cur, "csNGAppWindowTranslatesJSONSave", [link])
                 if resp:
                     return f"csNGAppWindowTranslatesJSONSave WARNING for '{ident}':\n{resp}"
